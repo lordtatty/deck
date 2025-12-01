@@ -1,8 +1,8 @@
 package deck_test
 
 import (
+	"bytes"
 	"context"
-	"sync"
 	"testing"
 	"time"
 
@@ -10,27 +10,22 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestState is now unsafe (no mutex) to demonstrate race conditions
 type TestState struct {
-	mu              sync.Mutex
 	Count           int
 	CompletionTimes map[string]time.Time
+	Buffer          []rune
 }
 
 func (s *TestState) Inc() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.Count++
 }
 
 func (s *TestState) GetCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	return s.Count
 }
 
 func (s *TestState) RecordCompletion(name string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.CompletionTimes == nil {
 		s.CompletionTimes = make(map[string]time.Time)
 	}
@@ -38,10 +33,14 @@ func (s *TestState) RecordCompletion(name string) {
 }
 
 func (s *TestState) GetCompletionTime(name string) (time.Time, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	t, ok := s.CompletionTimes[name]
 	return t, ok
+}
+
+func (s *TestState) Append(r rune) {
+	// Simulate slow write to increase race window
+	time.Sleep(10 * time.Microsecond)
+	s.Buffer = append(s.Buffer, r)
 }
 
 func TestDeck_Run_HappyPath(t *testing.T) {
@@ -185,6 +184,46 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 	// Assert
 	assert.NoError(t, err)
 	assert.Equal(t, 1, state.GetCount(), "Cue should run exactly once")
+}
+
+func TestDeck_Run_Concurrency_Race(t *testing.T) {
+	// Arrange
+	state := &TestState{Buffer: make([]rune, 0)}
+
+	// Create 100 cues that all stream the alphabet concurrently
+	count := 100
+	alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+	// Construct expected buffer: "ABC...Z" repeated count times
+	expected := bytes.Repeat([]byte(alphabet), count)
+
+	cues := make([]deck.Cue[TestState], count)
+	for i := 0; i < count; i++ {
+		cues[i] = deck.Cue[TestState]{
+			When: func(s *TestState) bool {
+				return true
+			},
+			Run: func(s *TestState) error {
+				for _, r := range alphabet {
+					s.Append(r)
+				}
+				return nil
+			},
+		}
+	}
+
+	sut := deck.New(cues...)
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err := sut.Run(ctx, state)
+
+	// Assert
+	assert.NoError(t, err)
+	// If race conditions occur, Buffer will be corrupted (missing chars, wrong order)
+	assert.Equal(t, string(expected), string(state.Buffer), "Buffer content should match expected sequence if updates are safe")
 }
 
 func assertExecutionOrder(t *testing.T, state *TestState, order ...string) {
