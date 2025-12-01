@@ -22,10 +22,13 @@ type Cue[S any] struct {
 }
 
 // New creates a new Deck with the given cues.
-// It returns an error if any cues have duplicate names.
+// It returns an error if any cues have duplicate names or empty names.
 func New[S any](cues ...Cue[S]) (*Deck[S], error) {
 	seen := make(map[string]bool)
 	for _, c := range cues {
+		if c.Name == "" {
+			return nil, fmt.Errorf("cue name cannot be empty")
+		}
 		if seen[c.Name] {
 			return nil, fmt.Errorf("duplicate cue name: %s", c.Name)
 		}

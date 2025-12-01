@@ -265,6 +265,22 @@ func TestDeck_New_DuplicateNames(t *testing.T) {
 	assert.Contains(t, err.Error(), "duplicate cue name: Duplicate")
 }
 
+func TestDeck_New_EmptyName(t *testing.T) {
+	// Arrange
+	cue := deck.Cue[TestState]{
+		Name: "",
+		When: func(s *TestState) bool { return true },
+		Run:  func(s *TestState) (func(*TestState), error) { return nil, nil },
+	}
+
+	// Act
+	_, err := deck.New(cue)
+
+	// Assert
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cue name cannot be empty")
+}
+
 func assertExecutionOrder(t *testing.T, state *TestState, order ...string) {
 	t.Helper()
 	for i := 0; i < len(order)-1; i++ {
