@@ -16,10 +16,10 @@ type Cue[S any] struct {
 	// Name is a unique identifier for the cue.
 	Name string
 	// When determines if the cue should run based on the current state and execution history.
-	When func(*S, Result) bool
+	When func(S, Result) bool
 	// Run performs the work associated with the cue.
 	// It returns a mutation function that updates the state, or an error.
-	Run func(*S) (func(*S), error)
+	Run func(S) (func(*S), error)
 }
 
 // New creates a new Deck with the given cues.
@@ -70,7 +70,15 @@ func (r Result) Completed(name string) bool {
 
 // Run starts the Deck loop. It continues until the context is cancelled.
 func (d *Deck[S]) Run(ctx context.Context, state *S) (Result, error) {
-	return newRunner(d, ctx, state).run()
+	// Create a local copy of the state to isolate execution
+	localState := *state
+	runner := newRunner(d, ctx, &localState)
+	result, err := runner.run()
+	if err == nil {
+		// Copy the final state back to the caller's pointer
+		*state = localState
+	}
+	return result, err
 }
 
 // runner encapsulates the state of a single Deck execution.
@@ -129,7 +137,8 @@ func (r *runner[S]) check() ([]Cue[S], []Cue[S]) {
 	currentResult := Result{CompletedCues: r.completed}
 
 	for _, c := range r.pending {
-		if c.When(r.state, currentResult) {
+		// Pass state by value (dereferenced)
+		if c.When(*r.state, currentResult) {
 			triggered = append(triggered, c)
 		} else {
 			nextPending = append(nextPending, c)
@@ -141,9 +150,11 @@ func (r *runner[S]) check() ([]Cue[S], []Cue[S]) {
 func (r *runner[S]) trigger(cues []Cue[S]) {
 	for _, c := range cues {
 		r.activeCount++
-		go func(cue Cue[S]) {
+		// Snapshot state for concurrent execution
+		currentState := *r.state
+		go func(cue Cue[S], state S) {
 			startTime := time.Now()
-			mutation, err := cue.Run(r.state)
+			mutation, err := cue.Run(state)
 			endTime := time.Now()
 			r.done <- cueResult[S]{
 				cue:       cue,
@@ -152,7 +163,7 @@ func (r *runner[S]) trigger(cues []Cue[S]) {
 				startTime: startTime,
 				endTime:   endTime,
 			}
-		}(c)
+		}(c, currentState)
 	}
 }
 

@@ -37,10 +37,10 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 
 	cue := deck.Cue[TestState]{
 		Name: "HappyPath",
-		When: func(s *TestState, r deck.Result) bool {
+		When: func(s TestState, r deck.Result) bool {
 			return s.GetCount() == 1
 		},
-		Run: func(s *TestState) (func(*TestState), error) {
+		Run: func(s TestState) (func(*TestState), error) {
 			return func(s *TestState) {
 				s.Inc()
 			}, nil
@@ -72,10 +72,10 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	// Cue 1: 0 -> 1
 	cue1 := deck.Cue[TestState]{
 		Name: "cue1",
-		When: func(s *TestState, r deck.Result) bool {
+		When: func(s TestState, r deck.Result) bool {
 			return s.GetCount() == 0
 		},
-		Run: func(s *TestState) (func(*TestState), error) {
+		Run: func(s TestState) (func(*TestState), error) {
 			// Ensure some time passes so timestamps are distinct
 			time.Sleep(1 * time.Millisecond)
 			return func(s *TestState) {
@@ -87,10 +87,10 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	// Cue 2: 1 -> 2
 	cue2 := deck.Cue[TestState]{
 		Name: "cue2",
-		When: func(s *TestState, r deck.Result) bool {
+		When: func(s TestState, r deck.Result) bool {
 			return s.GetCount() == 1
 		},
-		Run: func(s *TestState) (func(*TestState), error) {
+		Run: func(s TestState) (func(*TestState), error) {
 			return func(s *TestState) {
 				s.Inc()
 			}, nil
@@ -127,10 +127,10 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 	// Add a cue that sleeps for a long time
 	cue := deck.Cue[TestState]{
 		Name: "SleepyCue",
-		When: func(s *TestState, r deck.Result) bool {
+		When: func(s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s *TestState) (func(*TestState), error) {
+		Run: func(s TestState) (func(*TestState), error) {
 			time.Sleep(200 * time.Millisecond)
 			return nil, nil
 		},
@@ -169,10 +169,10 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 	// Add a cue that is always true
 	cue := deck.Cue[TestState]{
 		Name: "OneShot",
-		When: func(s *TestState, r deck.Result) bool {
+		When: func(s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s *TestState) (func(*TestState), error) {
+		Run: func(s TestState) (func(*TestState), error) {
 			return func(s *TestState) {
 				s.Inc()
 			}, nil
@@ -209,10 +209,10 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 	for i := range count {
 		cues[i] = deck.Cue[TestState]{
 			Name: fmt.Sprintf("Cue-%d", i),
-			When: func(s *TestState, r deck.Result) bool {
+			When: func(s TestState, r deck.Result) bool {
 				return true
 			},
-			Run: func(s *TestState) (func(*TestState), error) {
+			Run: func(s TestState) (func(*TestState), error) {
 				// Return mutation function that streams the alphabet
 				return func(s *TestState) {
 					for _, r := range alphabet {
@@ -243,13 +243,13 @@ func TestDeck_New_DuplicateNames(t *testing.T) {
 	// Arrange
 	cue1 := deck.Cue[TestState]{
 		Name: "Duplicate",
-		When: func(s *TestState, r deck.Result) bool { return true },
-		Run:  func(s *TestState) (func(*TestState), error) { return nil, nil },
+		When: func(s TestState, r deck.Result) bool { return true },
+		Run:  func(s TestState) (func(*TestState), error) { return nil, nil },
 	}
 	cue2 := deck.Cue[TestState]{
 		Name: "Duplicate",
-		When: func(s *TestState, r deck.Result) bool { return true },
-		Run:  func(s *TestState) (func(*TestState), error) { return nil, nil },
+		When: func(s TestState, r deck.Result) bool { return true },
+		Run:  func(s TestState) (func(*TestState), error) { return nil, nil },
 	}
 
 	// Act
@@ -264,8 +264,8 @@ func TestDeck_New_EmptyName(t *testing.T) {
 	// Arrange
 	cue := deck.Cue[TestState]{
 		Name: "",
-		When: func(s *TestState, r deck.Result) bool { return true },
-		Run:  func(s *TestState) (func(*TestState), error) { return nil, nil },
+		When: func(s TestState, r deck.Result) bool { return true },
+		Run:  func(s TestState) (func(*TestState), error) { return nil, nil },
 	}
 
 	// Act
@@ -282,8 +282,8 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 
 	cue1 := deck.Cue[TestState]{
 		Name: "CueA",
-		When: func(s *TestState, r deck.Result) bool { return s.Count == 0 },
-		Run: func(s *TestState) (func(*TestState), error) {
+		When: func(s TestState, r deck.Result) bool { return s.Count == 0 },
+		Run: func(s TestState) (func(*TestState), error) {
 			time.Sleep(10 * time.Millisecond) // Simulate work
 			return func(s *TestState) { s.Inc() }, nil
 		},
@@ -291,8 +291,8 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 
 	cue2 := deck.Cue[TestState]{
 		Name: "CueB",
-		When: func(s *TestState, r deck.Result) bool { return s.Count == 1 },
-		Run: func(s *TestState) (func(*TestState), error) {
+		When: func(s TestState, r deck.Result) bool { return s.Count == 1 },
+		Run: func(s TestState) (func(*TestState), error) {
 			time.Sleep(20 * time.Millisecond) // Simulate work
 			return func(s *TestState) { s.Inc() }, nil
 		},
@@ -339,19 +339,19 @@ func TestDeck_Run_TriggerOnHistory(t *testing.T) {
 
 	cue1 := deck.Cue[TestState]{
 		Name: "CueA",
-		When: func(s *TestState, r deck.Result) bool { return s.Count == 0 },
-		Run: func(s *TestState) (func(*TestState), error) {
+		When: func(s TestState, r deck.Result) bool { return s.Count == 0 },
+		Run: func(s TestState) (func(*TestState), error) {
 			return func(s *TestState) { s.Inc() }, nil
 		},
 	}
 
 	cue2 := deck.Cue[TestState]{
 		Name: "CueB",
-		When: func(s *TestState, r deck.Result) bool {
+		When: func(s TestState, r deck.Result) bool {
 			// Trigger only if CueA has completed
 			return r.Completed("CueA")
 		},
-		Run: func(s *TestState) (func(*TestState), error) {
+		Run: func(s TestState) (func(*TestState), error) {
 			return func(s *TestState) { s.Inc() }, nil
 		},
 	}
@@ -369,6 +369,100 @@ func TestDeck_Run_TriggerOnHistory(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 2, state.Count)
 	assertExecutionOrder(t, result, "CueA", "CueB")
+}
+
+func TestDeck_StateImmutability(t *testing.T) {
+	// Arrange
+	state := &TestState{Count: 0}
+
+	cue := deck.Cue[TestState]{
+		Name: "BadActor",
+		When: func(s TestState, r deck.Result) bool {
+			// Attempt to modify state in When (should be a copy)
+			s.Count = 999
+			return true
+		},
+		Run: func(s TestState) (func(*TestState), error) {
+			// Attempt to modify state in Run (should be a copy)
+			s.Count = 888
+			return func(s *TestState) {
+				// Only this mutation should affect the real state
+				s.Inc()
+			}, nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	_, err = sut.Run(ctx, state)
+
+	// Assert
+	assert.NoError(t, err)
+	assert.Equal(t, 1, state.Count, "State should only be modified by the mutation function")
+}
+
+func TestDeck_Run_ExternalModification(t *testing.T) {
+	// Arrange
+	state := &TestState{Count: 0}
+
+	started := make(chan struct{})
+	continueChan := make(chan struct{})
+
+	// Cue that signals start, waits, then increments
+	cue := deck.Cue[TestState]{
+		Name: "CoordinatedCue",
+		When: func(s TestState, r deck.Result) bool {
+			return s.Count == 0
+		},
+		Run: func(s TestState) (func(*TestState), error) {
+			close(started)
+			<-continueChan
+			return func(s *TestState) {
+				s.Inc()
+			}, nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// Start Run in background
+	errChan := make(chan error)
+	go func() {
+		_, err := sut.Run(ctx, state)
+		errChan <- err
+	}()
+
+	// Wait for cue to start (implies Run has copied state)
+	<-started
+
+	// Modify state externally.
+	// Since Run has already read state and is blocked on continueChan,
+	// and won't write back until after continueChan is closed,
+	// this write is safe if we ensure happens-before.
+	state.Count = 100
+
+	// Signal cue to continue
+	close(continueChan)
+
+	// Wait for Run to complete
+	err = <-errChan
+	assert.NoError(t, err)
+
+	// Assert
+	// The cue logic (When: s.Count == 0) used the initial state.
+	// The mutation (0 -> 1) is applied to the isolated state.
+	// The final isolated state (Count: 1) is copied back, overwriting the 100.
+	assert.Equal(t, 1, state.Count, "External modification should be overwritten by isolated run result")
 }
 
 func assertExecutionOrder(t *testing.T, result deck.Result, order ...string) {
