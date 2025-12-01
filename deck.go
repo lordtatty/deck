@@ -28,66 +28,80 @@ func New[S any](state *S, cues ...Cue[S]) *Deck[S] {
 
 // Run starts the Deck loop. It continues until the context is cancelled.
 func (d *Deck[S]) Run(ctx context.Context) error {
-	// pending contains cues that are waiting to be checked/run
+	return newRunner(d, ctx).run()
+}
+
+// runner encapsulates the state of a single Deck execution.
+type runner[S any] struct {
+	deck        *Deck[S]
+	ctx         context.Context
+	pending     []Cue[S]
+	triggered   []Cue[S]
+	done        chan Cue[S]
+	activeCount int
+}
+
+func newRunner[S any](d *Deck[S], ctx context.Context) *runner[S] {
 	pending := make([]Cue[S], len(d.cues))
 	copy(pending, d.cues)
 
-	// triggered contains cues that have matched and are ready to run
-	var triggered []Cue[S]
+	return &runner[S]{
+		deck:    d,
+		ctx:     ctx,
+		pending: pending,
+		done:    make(chan Cue[S]),
+	}
+}
 
-	// done receives cues that have completed execution
-	done := make(chan Cue[S])
-
-	activeCount := 0
-
+func (r *runner[S]) run() error {
 	for {
-		// Check Phase: Move matching cues from pending to triggered
-		// We iterate backwards so we can remove items from pending easily
-		// Note: This is a simple implementation; for order preservation we might want a different approach,
-		// but since we re-evaluate all pending, order in pending doesn't strictly matter for correctness
-		// of "eventually running".
-		// However, to match the previous behavior (check in order), we should iterate forward and rebuild pending.
-		nextPending := pending[:0]
-		for _, c := range pending {
-			if c.When(d.state) {
-				triggered = append(triggered, c)
-			} else {
-				nextPending = append(nextPending, c)
-			}
-		}
-		pending = nextPending
+		r.check()
+		r.trigger()
 
-		// Trigger Phase: Launch goroutines for triggered cues
-		for _, c := range triggered {
-			activeCount++
-			go func(cue Cue[S]) {
-				// We ignore errors for now as per previous implementation,
-				// or we could log them. The signature returns error but we can't easily propagate it
-				// without cancelling everything. For now, we just run.
-				_ = cue.Run(d.state)
-				done <- cue
-			}(c)
-		}
-		triggered = triggered[:0] // Clear triggered
-
-		// Wait Phase
-		if activeCount == 0 {
-			// If nothing is active and nothing is pending (that matched), we are stable.
-			// But we still have cues in pending that didn't match.
-			// If we return here, we exit.
-			// The requirement is "run until stable".
-			// If activeCount is 0, it means no cues are running.
-			// Since we just checked all pending cues and moved matches to triggered,
-			// if triggered is empty (which it is now), then no progress can be made.
+		if r.isStable() {
 			return nil
 		}
 
-		// Wait for something to complete or context cancel
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-done:
-			activeCount--
+		if err := r.wait(); err != nil {
+			return err
 		}
+	}
+}
+
+func (r *runner[S]) check() {
+	nextPending := r.pending[:0]
+	for _, c := range r.pending {
+		if c.When(r.deck.state) {
+			r.triggered = append(r.triggered, c)
+		} else {
+			nextPending = append(nextPending, c)
+		}
+	}
+	r.pending = nextPending
+}
+
+func (r *runner[S]) trigger() {
+	for _, c := range r.triggered {
+		r.activeCount++
+		go func(cue Cue[S]) {
+			_ = cue.Run(r.deck.state)
+			r.done <- cue
+		}(c)
+	}
+	r.triggered = r.triggered[:0]
+}
+
+func (r *runner[S]) isStable() bool {
+	return r.activeCount == 0
+}
+
+func (r *runner[S]) wait() error {
+	select {
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	case <-r.done:
+		r.activeCount--
+		// We do not add the cue back to pending. It has run once and is done.
+		return nil
 	}
 }
