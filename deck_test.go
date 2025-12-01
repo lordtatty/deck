@@ -3,6 +3,7 @@ package deck_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -48,6 +49,7 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 	state := &TestState{Count: 1}
 
 	cue := deck.Cue[TestState]{
+		Name: "HappyPath",
 		When: func(s *TestState) bool {
 			return s.GetCount() == 1
 		},
@@ -58,14 +60,15 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 		},
 	}
 
-	sut := deck.New(cue)
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
 
 	// Act
 	// Run for a short duration to allow the loop to execute
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	err := sut.Run(ctx, state)
+	err = sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -81,6 +84,7 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 
 	// Cue 1: 0 -> 1
 	cue1 := deck.Cue[TestState]{
+		Name: "cue1",
 		When: func(s *TestState) bool {
 			return s.GetCount() == 0
 		},
@@ -96,6 +100,7 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 
 	// Cue 2: 1 -> 2
 	cue2 := deck.Cue[TestState]{
+		Name: "cue2",
 		When: func(s *TestState) bool {
 			return s.GetCount() == 1
 		},
@@ -107,13 +112,14 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 		},
 	}
 
-	sut := deck.New(cue1, cue2)
+	sut, err := deck.New(cue1, cue2)
+	assert.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	err := sut.Run(ctx, state)
+	err = sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -128,6 +134,7 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 
 	// Add a cue that sleeps for a long time
 	cue := deck.Cue[TestState]{
+		Name: "SleepyCue",
 		When: func(s *TestState) bool {
 			return true
 		},
@@ -137,7 +144,8 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 		},
 	}
 
-	sut := deck.New(cue)
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithCancel(context.Background())
@@ -167,6 +175,7 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 
 	// Add a cue that is always true
 	cue := deck.Cue[TestState]{
+		Name: "OneShot",
 		When: func(s *TestState) bool {
 			return true
 		},
@@ -177,13 +186,14 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 		},
 	}
 
-	sut := deck.New(cue)
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	err := sut.Run(ctx, state)
+	err = sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -204,6 +214,7 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 	cues := make([]deck.Cue[TestState], count)
 	for i := range count {
 		cues[i] = deck.Cue[TestState]{
+			Name: fmt.Sprintf("Cue-%d", i),
 			When: func(s *TestState) bool {
 				return true
 			},
@@ -218,18 +229,40 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 		}
 	}
 
-	sut := deck.New(cues...)
+	sut, err := deck.New(cues...)
+	assert.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := sut.Run(ctx, state)
+	err = sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
 	// If race conditions occur, Buffer will be corrupted (missing chars, wrong order)
 	assert.Equal(t, string(expected), string(state.Buffer), "Buffer content should match expected sequence if updates are safe")
+}
+
+func TestDeck_New_DuplicateNames(t *testing.T) {
+	// Arrange
+	cue1 := deck.Cue[TestState]{
+		Name: "Duplicate",
+		When: func(s *TestState) bool { return true },
+		Run:  func(s *TestState) (func(*TestState), error) { return nil, nil },
+	}
+	cue2 := deck.Cue[TestState]{
+		Name: "Duplicate",
+		When: func(s *TestState) bool { return true },
+		Run:  func(s *TestState) (func(*TestState), error) { return nil, nil },
+	}
+
+	// Act
+	_, err := deck.New(cue1, cue2)
+
+	// Assert
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "duplicate cue name: Duplicate")
 }
 
 func assertExecutionOrder(t *testing.T, state *TestState, order ...string) {

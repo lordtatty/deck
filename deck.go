@@ -2,6 +2,7 @@ package deck
 
 import (
 	"context"
+	"fmt"
 )
 
 // Deck manages a set of agents (Cues) that operate on a shared state.
@@ -11,6 +12,8 @@ type Deck[S any] struct {
 
 // Cue represents an agent that runs when a condition is met.
 type Cue[S any] struct {
+	// Name is the unique identifier for the agent.
+	Name string
 	// When returns true if the agent should run.
 	When func(*S) bool
 	// Run executes the agent's logic.
@@ -19,10 +22,18 @@ type Cue[S any] struct {
 }
 
 // New creates a new Deck with the given cues.
-func New[S any](cues ...Cue[S]) *Deck[S] {
+// It returns an error if any cues have duplicate names.
+func New[S any](cues ...Cue[S]) (*Deck[S], error) {
+	seen := make(map[string]bool)
+	for _, c := range cues {
+		if seen[c.Name] {
+			return nil, fmt.Errorf("duplicate cue name: %s", c.Name)
+		}
+		seen[c.Name] = true
+	}
 	return &Deck[S]{
 		cues: cues,
-	}
+	}, nil
 }
 
 // Run starts the Deck loop. It continues until the context is cancelled.
