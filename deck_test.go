@@ -68,11 +68,12 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	err = sut.Run(ctx, state)
+	result, err := sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
 	assert.Equal(t, 2, state.GetCount(), "Count should be incremented to 2")
+	assert.Contains(t, result.CompletedCues, "HappyPath")
 }
 
 func TestDeck_Run_ChainReaction(t *testing.T) {
@@ -119,13 +120,14 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	err = sut.Run(ctx, state)
+	result, err := sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
 	assert.Equal(t, 2, state.GetCount(), "Count should be incremented to 2 via chain reaction")
 
 	assertExecutionOrder(t, state, "cue1", "cue2")
+	assert.Equal(t, []string{"cue1", "cue2"}, result.CompletedCues)
 }
 
 func TestDeck_Run_Cancellation(t *testing.T) {
@@ -153,7 +155,8 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 	// Start Run in a goroutine
 	errChan := make(chan error)
 	go func() {
-		errChan <- sut.Run(ctx, state)
+		_, err := sut.Run(ctx, state)
+		errChan <- err
 	}()
 
 	// Cancel shortly after
@@ -193,11 +196,12 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	err = sut.Run(ctx, state)
+	result, err := sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
 	assert.Equal(t, 1, state.GetCount(), "Cue should run exactly once")
+	assert.Equal(t, []string{"OneShot"}, result.CompletedCues)
 }
 
 func TestDeck_Run_Concurrency_Race(t *testing.T) {
@@ -236,12 +240,13 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err = sut.Run(ctx, state)
+	result, err := sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
 	// If race conditions occur, Buffer will be corrupted (missing chars, wrong order)
 	assert.Equal(t, string(expected), string(state.Buffer), "Buffer content should match expected sequence if updates are safe")
+	assert.Len(t, result.CompletedCues, count)
 }
 
 func TestDeck_New_DuplicateNames(t *testing.T) {
@@ -279,6 +284,40 @@ func TestDeck_New_EmptyName(t *testing.T) {
 	// Assert
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "cue name cannot be empty")
+}
+
+func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
+	// Arrange
+	state := &TestState{Count: 0}
+
+	cue1 := deck.Cue[TestState]{
+		Name: "CueA",
+		When: func(s *TestState) bool { return s.Count == 0 },
+		Run: func(s *TestState) (func(*TestState), error) {
+			return func(s *TestState) { s.Inc() }, nil
+		},
+	}
+
+	cue2 := deck.Cue[TestState]{
+		Name: "CueB",
+		When: func(s *TestState) bool { return s.Count == 1 },
+		Run: func(s *TestState) (func(*TestState), error) {
+			return func(s *TestState) { s.Inc() }, nil
+		},
+	}
+
+	sut, err := deck.New(cue1, cue2)
+	assert.NoError(t, err)
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	result, err := sut.Run(ctx, state)
+
+	// Assert
+	assert.NoError(t, err)
+	assert.ElementsMatch(t, []string{"CueA", "CueB"}, result.CompletedCues)
 }
 
 func assertExecutionOrder(t *testing.T, state *TestState, order ...string) {

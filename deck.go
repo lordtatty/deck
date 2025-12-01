@@ -39,8 +39,13 @@ func New[S any](cues ...Cue[S]) (*Deck[S], error) {
 	}, nil
 }
 
+// Result contains information about the Deck execution.
+type Result struct {
+	CompletedCues []string
+}
+
 // Run starts the Deck loop. It continues until the context is cancelled.
-func (d *Deck[S]) Run(ctx context.Context, state *S) error {
+func (d *Deck[S]) Run(ctx context.Context, state *S) (Result, error) {
 	return newRunner(d, ctx, state).run()
 }
 
@@ -52,6 +57,7 @@ type runner[S any] struct {
 	pending     []Cue[S]
 	done        chan cueResult[S]
 	activeCount int
+	completed   []string
 }
 
 type cueResult[S any] struct {
@@ -73,18 +79,18 @@ func newRunner[S any](d *Deck[S], ctx context.Context, state *S) *runner[S] {
 	}
 }
 
-func (r *runner[S]) run() error {
+func (r *runner[S]) run() (Result, error) {
 	for {
 		hits, misses := r.check()
 		r.pending = misses
 		r.trigger(hits)
 
 		if r.isStable() {
-			return nil
+			return Result{CompletedCues: r.completed}, nil
 		}
 
 		if err := r.wait(); err != nil {
-			return err
+			return Result{CompletedCues: r.completed}, err
 		}
 	}
 }
@@ -125,6 +131,7 @@ func (r *runner[S]) wait() error {
 		if result.mutation != nil {
 			result.mutation(r.state)
 		}
+		r.completed = append(r.completed, result.cue.Name)
 		return nil
 	}
 }
