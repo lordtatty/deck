@@ -36,7 +36,6 @@ type runner[S any] struct {
 	deck        *Deck[S]
 	ctx         context.Context
 	pending     []Cue[S]
-	triggered   []Cue[S]
 	done        chan Cue[S]
 	activeCount int
 }
@@ -55,8 +54,10 @@ func newRunner[S any](d *Deck[S], ctx context.Context) *runner[S] {
 
 func (r *runner[S]) run() error {
 	for {
-		r.check()
-		r.trigger()
+		// Check for triggereable cues and run
+		triggered, nextPending := r.check()
+		r.pending = nextPending
+		r.trigger(triggered)
 
 		if r.isStable() {
 			return nil
@@ -68,27 +69,27 @@ func (r *runner[S]) run() error {
 	}
 }
 
-func (r *runner[S]) check() {
+func (r *runner[S]) check() ([]Cue[S], []Cue[S]) {
+	var triggered []Cue[S]
 	nextPending := r.pending[:0]
 	for _, c := range r.pending {
 		if c.When(r.deck.state) {
-			r.triggered = append(r.triggered, c)
+			triggered = append(triggered, c)
 		} else {
 			nextPending = append(nextPending, c)
 		}
 	}
-	r.pending = nextPending
+	return triggered, nextPending
 }
 
-func (r *runner[S]) trigger() {
-	for _, c := range r.triggered {
+func (r *runner[S]) trigger(cues []Cue[S]) {
+	for _, c := range cues {
 		r.activeCount++
 		go func(cue Cue[S]) {
 			_ = cue.Run(r.deck.state)
 			r.done <- cue
 		}(c)
 	}
-	r.triggered = r.triggered[:0]
 }
 
 func (r *runner[S]) isStable() bool {
