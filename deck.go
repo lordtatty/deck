@@ -54,10 +54,9 @@ func newRunner[S any](d *Deck[S], ctx context.Context) *runner[S] {
 
 func (r *runner[S]) run() error {
 	for {
-		// Check for triggereable cues and run
-		triggered, nextPending := r.check()
-		r.pending = nextPending
-		r.trigger(triggered)
+		hits, misses := r.check()
+		r.pending = misses
+		r.trigger(hits)
 
 		if r.isStable() {
 			return nil
@@ -102,7 +101,6 @@ func (r *runner[S]) wait() error {
 		return r.ctx.Err()
 	case <-r.done:
 		r.activeCount--
-		// We do not add the cue back to pending. It has run once and is done.
 		return nil
 	}
 }
