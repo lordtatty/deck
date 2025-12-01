@@ -14,7 +14,8 @@ type Cue[S any] struct {
 	// When returns true if the agent should run.
 	When func(*S) bool
 	// Run executes the agent's logic.
-	Run func(*S) error
+	// It returns a mutation function that safely updates the state, or an error.
+	Run func(*S) (func(*S), error)
 }
 
 // New creates a new Deck with the given cues.
@@ -35,8 +36,14 @@ type runner[S any] struct {
 	ctx         context.Context
 	state       *S
 	pending     []Cue[S]
-	done        chan Cue[S]
+	done        chan cueResult[S]
 	activeCount int
+}
+
+type cueResult[S any] struct {
+	cue      Cue[S]
+	mutation func(*S)
+	err      error
 }
 
 func newRunner[S any](d *Deck[S], ctx context.Context, state *S) *runner[S] {
@@ -48,7 +55,7 @@ func newRunner[S any](d *Deck[S], ctx context.Context, state *S) *runner[S] {
 		ctx:     ctx,
 		state:   state,
 		pending: pending,
-		done:    make(chan Cue[S]),
+		done:    make(chan cueResult[S]),
 	}
 }
 
@@ -85,8 +92,8 @@ func (r *runner[S]) trigger(cues []Cue[S]) {
 	for _, c := range cues {
 		r.activeCount++
 		go func(cue Cue[S]) {
-			_ = cue.Run(r.state)
-			r.done <- cue
+			mutation, err := cue.Run(r.state)
+			r.done <- cueResult[S]{cue: cue, mutation: mutation, err: err}
 		}(c)
 	}
 }
@@ -99,8 +106,11 @@ func (r *runner[S]) wait() error {
 	select {
 	case <-r.ctx.Done():
 		return r.ctx.Err()
-	case <-r.done:
+	case result := <-r.done:
 		r.activeCount--
+		if result.mutation != nil {
+			result.mutation(r.state)
+		}
 		return nil
 	}
 }

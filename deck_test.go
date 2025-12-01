@@ -51,9 +51,10 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 		When: func(s *TestState) bool {
 			return s.GetCount() == 1
 		},
-		Run: func(s *TestState) error {
-			s.Inc()
-			return nil
+		Run: func(s *TestState) (func(*TestState), error) {
+			return func(s *TestState) {
+				s.Inc()
+			}, nil
 		},
 	}
 
@@ -83,12 +84,13 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 		When: func(s *TestState) bool {
 			return s.GetCount() == 0
 		},
-		Run: func(s *TestState) error {
-			s.Inc()
-			state.RecordCompletion("cue1")
+		Run: func(s *TestState) (func(*TestState), error) {
 			// Ensure some time passes so timestamps are distinct
 			time.Sleep(1 * time.Millisecond)
-			return nil
+			return func(s *TestState) {
+				s.Inc()
+				state.RecordCompletion("cue1")
+			}, nil
 		},
 	}
 
@@ -97,10 +99,11 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 		When: func(s *TestState) bool {
 			return s.GetCount() == 1
 		},
-		Run: func(s *TestState) error {
-			s.Inc()
-			state.RecordCompletion("cue2")
-			return nil
+		Run: func(s *TestState) (func(*TestState), error) {
+			return func(s *TestState) {
+				s.Inc()
+				state.RecordCompletion("cue2")
+			}, nil
 		},
 	}
 
@@ -128,9 +131,9 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 		When: func(s *TestState) bool {
 			return true
 		},
-		Run: func(s *TestState) error {
+		Run: func(s *TestState) (func(*TestState), error) {
 			time.Sleep(200 * time.Millisecond)
-			return nil
+			return nil, nil
 		},
 	}
 
@@ -167,9 +170,10 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 		When: func(s *TestState) bool {
 			return true
 		},
-		Run: func(s *TestState) error {
-			s.Inc()
-			return nil
+		Run: func(s *TestState) (func(*TestState), error) {
+			return func(s *TestState) {
+				s.Inc()
+			}, nil
 		},
 	}
 
@@ -198,16 +202,18 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 	expected := bytes.Repeat([]byte(alphabet), count)
 
 	cues := make([]deck.Cue[TestState], count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		cues[i] = deck.Cue[TestState]{
 			When: func(s *TestState) bool {
 				return true
 			},
-			Run: func(s *TestState) error {
-				for _, r := range alphabet {
-					s.Append(r)
-				}
-				return nil
+			Run: func(s *TestState) (func(*TestState), error) {
+				// Return mutation function that streams the alphabet
+				return func(s *TestState) {
+					for _, r := range alphabet {
+						s.Append(r)
+					}
+				}, nil
 			},
 		}
 	}
