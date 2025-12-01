@@ -465,6 +465,35 @@ func TestDeck_Run_ExternalModification(t *testing.T) {
 	assert.Equal(t, 1, state.Count, "External modification should be overwritten by isolated run result")
 }
 
+func TestDeck_Run_NilWhen(t *testing.T) {
+	// Arrange
+	state := &TestState{Count: 0}
+
+	cue := deck.Cue[TestState]{
+		Name: "AlwaysRun",
+		When: nil, // Should default to true
+		Run: func(s TestState) (func(*TestState), error) {
+			return func(s *TestState) {
+				s.Inc()
+			}, nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+
+	result, err := sut.Run(ctx, state)
+
+	// Assert
+	assert.NoError(t, err)
+	assert.Equal(t, 1, state.Count, "Cue with nil When should run")
+	assert.Equal(t, "AlwaysRun", result.CompletedCues[0].Name)
+}
+
 func assertExecutionOrder(t *testing.T, result deck.Result, order ...string) {
 	t.Helper()
 

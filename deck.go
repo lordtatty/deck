@@ -138,7 +138,8 @@ func (r *runner[S]) check() ([]Cue[S], []Cue[S]) {
 
 	for _, c := range r.pending {
 		// Pass state by value (dereferenced)
-		if c.When(*r.state, currentResult) {
+		// If When is nil, default to true (always run)
+		if c.When == nil || c.When(*r.state, currentResult) {
 			triggered = append(triggered, c)
 		} else {
 			nextPending = append(nextPending, c)
