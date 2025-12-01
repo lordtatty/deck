@@ -1,0 +1,8 @@
+pkgname: mocks
+dir: "{{.PackagePath}}/mocks"
+filename: mocks.go
+all: true
+packages:
+  github.com/lordtatty/deck:
+    config:
+      all: true
