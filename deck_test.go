@@ -37,7 +37,7 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 
 	cue := deck.Cue[TestState]{
 		Name: "HappyPath",
-		When: func(s *TestState) bool {
+		When: func(s *TestState, r deck.Result) bool {
 			return s.GetCount() == 1
 		},
 		Run: func(s *TestState) (func(*TestState), error) {
@@ -72,7 +72,7 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	// Cue 1: 0 -> 1
 	cue1 := deck.Cue[TestState]{
 		Name: "cue1",
-		When: func(s *TestState) bool {
+		When: func(s *TestState, r deck.Result) bool {
 			return s.GetCount() == 0
 		},
 		Run: func(s *TestState) (func(*TestState), error) {
@@ -87,7 +87,7 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	// Cue 2: 1 -> 2
 	cue2 := deck.Cue[TestState]{
 		Name: "cue2",
-		When: func(s *TestState) bool {
+		When: func(s *TestState, r deck.Result) bool {
 			return s.GetCount() == 1
 		},
 		Run: func(s *TestState) (func(*TestState), error) {
@@ -127,7 +127,7 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 	// Add a cue that sleeps for a long time
 	cue := deck.Cue[TestState]{
 		Name: "SleepyCue",
-		When: func(s *TestState) bool {
+		When: func(s *TestState, r deck.Result) bool {
 			return true
 		},
 		Run: func(s *TestState) (func(*TestState), error) {
@@ -169,7 +169,7 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 	// Add a cue that is always true
 	cue := deck.Cue[TestState]{
 		Name: "OneShot",
-		When: func(s *TestState) bool {
+		When: func(s *TestState, r deck.Result) bool {
 			return true
 		},
 		Run: func(s *TestState) (func(*TestState), error) {
@@ -209,7 +209,7 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 	for i := range count {
 		cues[i] = deck.Cue[TestState]{
 			Name: fmt.Sprintf("Cue-%d", i),
-			When: func(s *TestState) bool {
+			When: func(s *TestState, r deck.Result) bool {
 				return true
 			},
 			Run: func(s *TestState) (func(*TestState), error) {
@@ -243,12 +243,12 @@ func TestDeck_New_DuplicateNames(t *testing.T) {
 	// Arrange
 	cue1 := deck.Cue[TestState]{
 		Name: "Duplicate",
-		When: func(s *TestState) bool { return true },
+		When: func(s *TestState, r deck.Result) bool { return true },
 		Run:  func(s *TestState) (func(*TestState), error) { return nil, nil },
 	}
 	cue2 := deck.Cue[TestState]{
 		Name: "Duplicate",
-		When: func(s *TestState) bool { return true },
+		When: func(s *TestState, r deck.Result) bool { return true },
 		Run:  func(s *TestState) (func(*TestState), error) { return nil, nil },
 	}
 
@@ -264,7 +264,7 @@ func TestDeck_New_EmptyName(t *testing.T) {
 	// Arrange
 	cue := deck.Cue[TestState]{
 		Name: "",
-		When: func(s *TestState) bool { return true },
+		When: func(s *TestState, r deck.Result) bool { return true },
 		Run:  func(s *TestState) (func(*TestState), error) { return nil, nil },
 	}
 
@@ -282,7 +282,7 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 
 	cue1 := deck.Cue[TestState]{
 		Name: "CueA",
-		When: func(s *TestState) bool { return s.Count == 0 },
+		When: func(s *TestState, r deck.Result) bool { return s.Count == 0 },
 		Run: func(s *TestState) (func(*TestState), error) {
 			time.Sleep(10 * time.Millisecond) // Simulate work
 			return func(s *TestState) { s.Inc() }, nil
@@ -291,7 +291,7 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 
 	cue2 := deck.Cue[TestState]{
 		Name: "CueB",
-		When: func(s *TestState) bool { return s.Count == 1 },
+		When: func(s *TestState, r deck.Result) bool { return s.Count == 1 },
 		Run: func(s *TestState) (func(*TestState), error) {
 			time.Sleep(20 * time.Millisecond) // Simulate work
 			return func(s *TestState) { s.Inc() }, nil
@@ -331,6 +331,44 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 			assert.True(t, c.Duration() >= 20*time.Millisecond, "CueB duration should be at least 20ms")
 		}
 	}
+}
+
+func TestDeck_Run_TriggerOnHistory(t *testing.T) {
+	// Arrange
+	state := &TestState{Count: 0}
+
+	cue1 := deck.Cue[TestState]{
+		Name: "CueA",
+		When: func(s *TestState, r deck.Result) bool { return s.Count == 0 },
+		Run: func(s *TestState) (func(*TestState), error) {
+			return func(s *TestState) { s.Inc() }, nil
+		},
+	}
+
+	cue2 := deck.Cue[TestState]{
+		Name: "CueB",
+		When: func(s *TestState, r deck.Result) bool {
+			// Trigger only if CueA has completed
+			return r.Completed("CueA")
+		},
+		Run: func(s *TestState) (func(*TestState), error) {
+			return func(s *TestState) { s.Inc() }, nil
+		},
+	}
+
+	sut, err := deck.New(cue1, cue2)
+	assert.NoError(t, err)
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	result, err := sut.Run(ctx, state)
+
+	// Assert
+	assert.NoError(t, err)
+	assert.Equal(t, 2, state.Count)
+	assertExecutionOrder(t, result, "CueA", "CueB")
 }
 
 func assertExecutionOrder(t *testing.T, result deck.Result, order ...string) {

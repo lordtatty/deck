@@ -11,14 +11,14 @@ type Deck[S any] struct {
 	cues []Cue[S]
 }
 
-// Cue represents an agent that runs when a condition is met.
+// Cue represents a single unit of work in the Deck.
 type Cue[S any] struct {
-	// Name is the unique identifier for the agent.
+	// Name is a unique identifier for the cue.
 	Name string
-	// When returns true if the agent should run.
-	When func(*S) bool
-	// Run executes the agent's logic.
-	// It returns a mutation function that safely updates the state, or an error.
+	// When determines if the cue should run based on the current state and execution history.
+	When func(*S, Result) bool
+	// Run performs the work associated with the cue.
+	// It returns a mutation function that updates the state, or an error.
 	Run func(*S) (func(*S), error)
 }
 
@@ -56,6 +56,16 @@ func (c CompletedCue) Duration() time.Duration {
 type Result struct {
 	// CompletedCues is a list of cues that executed successfully.
 	CompletedCues []CompletedCue
+}
+
+// Completed returns true if a cue with the given name has successfully executed.
+func (r Result) Completed(name string) bool {
+	for _, c := range r.CompletedCues {
+		if c.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Run starts the Deck loop. It continues until the context is cancelled.
@@ -114,8 +124,12 @@ func (r *runner[S]) run() (Result, error) {
 func (r *runner[S]) check() ([]Cue[S], []Cue[S]) {
 	var triggered []Cue[S]
 	nextPending := r.pending[:0]
+
+	// Construct current result for When check
+	currentResult := Result{CompletedCues: r.completed}
+
 	for _, c := range r.pending {
-		if c.When(r.state) {
+		if c.When(r.state, currentResult) {
 			triggered = append(triggered, c)
 		} else {
 			nextPending = append(nextPending, c)
