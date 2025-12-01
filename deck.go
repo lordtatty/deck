@@ -6,8 +6,7 @@ import (
 
 // Deck manages a set of agents (Cues) that operate on a shared state.
 type Deck[S any] struct {
-	state *S
-	cues  []Cue[S]
+	cues []Cue[S]
 }
 
 // Cue represents an agent that runs when a condition is met.
@@ -18,35 +17,36 @@ type Cue[S any] struct {
 	Run func(*S) error
 }
 
-// New creates a new Deck with the given initial state and cues.
-func New[S any](state *S, cues ...Cue[S]) *Deck[S] {
+// New creates a new Deck with the given cues.
+func New[S any](cues ...Cue[S]) *Deck[S] {
 	return &Deck[S]{
-		state: state,
-		cues:  cues,
+		cues: cues,
 	}
 }
 
 // Run starts the Deck loop. It continues until the context is cancelled.
-func (d *Deck[S]) Run(ctx context.Context) error {
-	return newRunner(d, ctx).run()
+func (d *Deck[S]) Run(ctx context.Context, state *S) error {
+	return newRunner(d, ctx, state).run()
 }
 
 // runner encapsulates the state of a single Deck execution.
 type runner[S any] struct {
 	deck        *Deck[S]
 	ctx         context.Context
+	state       *S
 	pending     []Cue[S]
 	done        chan Cue[S]
 	activeCount int
 }
 
-func newRunner[S any](d *Deck[S], ctx context.Context) *runner[S] {
+func newRunner[S any](d *Deck[S], ctx context.Context, state *S) *runner[S] {
 	pending := make([]Cue[S], len(d.cues))
 	copy(pending, d.cues)
 
 	return &runner[S]{
 		deck:    d,
 		ctx:     ctx,
+		state:   state,
 		pending: pending,
 		done:    make(chan Cue[S]),
 	}
@@ -72,7 +72,7 @@ func (r *runner[S]) check() ([]Cue[S], []Cue[S]) {
 	var triggered []Cue[S]
 	nextPending := r.pending[:0]
 	for _, c := range r.pending {
-		if c.When(r.deck.state) {
+		if c.When(r.state) {
 			triggered = append(triggered, c)
 		} else {
 			nextPending = append(nextPending, c)
@@ -85,7 +85,7 @@ func (r *runner[S]) trigger(cues []Cue[S]) {
 	for _, c := range cues {
 		r.activeCount++
 		go func(cue Cue[S]) {
-			_ = cue.Run(r.deck.state)
+			_ = cue.Run(r.state)
 			r.done <- cue
 		}(c)
 	}

@@ -58,14 +58,14 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 		},
 	}
 
-	sut := deck.New(state, cue)
+	sut := deck.New(cue)
 
 	// Act
 	// Run for a short duration to allow the loop to execute
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	err := sut.Run(ctx)
+	err := sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -105,13 +105,13 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 		},
 	}
 
-	sut := deck.New(state, cue1, cue2)
+	sut := deck.New(cue1, cue2)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	err := sut.Run(ctx)
+	err := sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -135,7 +135,7 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 		},
 	}
 
-	sut := deck.New(state, cue)
+	sut := deck.New(cue)
 
 	// Act
 	ctx, cancel := context.WithCancel(context.Background())
@@ -143,7 +143,7 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 	// Start Run in a goroutine
 	errChan := make(chan error)
 	go func() {
-		errChan <- sut.Run(ctx)
+		errChan <- sut.Run(ctx, state)
 	}()
 
 	// Cancel shortly after
@@ -174,13 +174,13 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 		},
 	}
 
-	sut := deck.New(state, cue)
+	sut := deck.New(cue)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	err := sut.Run(ctx)
+	err := sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
