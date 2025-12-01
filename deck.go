@@ -3,6 +3,7 @@ package deck
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // Deck manages a set of agents (Cues) that operate on a shared state.
@@ -39,9 +40,22 @@ func New[S any](cues ...Cue[S]) (*Deck[S], error) {
 	}, nil
 }
 
+// CompletedCue contains information about a successfully executed cue.
+type CompletedCue struct {
+	Name      string
+	StartTime time.Time
+	EndTime   time.Time
+}
+
+// Duration returns the time taken for the cue to execute.
+func (c CompletedCue) Duration() time.Duration {
+	return c.EndTime.Sub(c.StartTime)
+}
+
 // Result contains information about the Deck execution.
 type Result struct {
-	CompletedCues []string
+	// CompletedCues is a list of cues that executed successfully.
+	CompletedCues []CompletedCue
 }
 
 // Run starts the Deck loop. It continues until the context is cancelled.
@@ -57,13 +71,15 @@ type runner[S any] struct {
 	pending     []Cue[S]
 	done        chan cueResult[S]
 	activeCount int
-	completed   []string
+	completed   []CompletedCue
 }
 
 type cueResult[S any] struct {
-	cue      Cue[S]
-	mutation func(*S)
-	err      error
+	cue       Cue[S]
+	mutation  func(*S)
+	err       error
+	startTime time.Time
+	endTime   time.Time
 }
 
 func newRunner[S any](d *Deck[S], ctx context.Context, state *S) *runner[S] {
@@ -112,8 +128,16 @@ func (r *runner[S]) trigger(cues []Cue[S]) {
 	for _, c := range cues {
 		r.activeCount++
 		go func(cue Cue[S]) {
+			startTime := time.Now()
 			mutation, err := cue.Run(r.state)
-			r.done <- cueResult[S]{cue: cue, mutation: mutation, err: err}
+			endTime := time.Now()
+			r.done <- cueResult[S]{
+				cue:       cue,
+				mutation:  mutation,
+				err:       err,
+				startTime: startTime,
+				endTime:   endTime,
+			}
 		}(c)
 	}
 }
@@ -131,7 +155,11 @@ func (r *runner[S]) wait() error {
 		if result.mutation != nil {
 			result.mutation(r.state)
 		}
-		r.completed = append(r.completed, result.cue.Name)
+		r.completed = append(r.completed, CompletedCue{
+			Name:      result.cue.Name,
+			StartTime: result.startTime,
+			EndTime:   result.endTime,
+		})
 		return nil
 	}
 }

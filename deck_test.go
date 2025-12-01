@@ -73,7 +73,7 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 	// Assert
 	assert.NoError(t, err)
 	assert.Equal(t, 2, state.GetCount(), "Count should be incremented to 2")
-	assert.Contains(t, result.CompletedCues, "HappyPath")
+	assert.Equal(t, "HappyPath", result.CompletedCues[0].Name)
 }
 
 func TestDeck_Run_ChainReaction(t *testing.T) {
@@ -127,7 +127,13 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	assert.Equal(t, 2, state.GetCount(), "Count should be incremented to 2 via chain reaction")
 
 	assertExecutionOrder(t, state, "cue1", "cue2")
-	assert.Equal(t, []string{"cue1", "cue2"}, result.CompletedCues)
+
+	// Verify names in result
+	var names []string
+	for _, c := range result.CompletedCues {
+		names = append(names, c.Name)
+	}
+	assert.Equal(t, []string{"cue1", "cue2"}, names)
 }
 
 func TestDeck_Run_Cancellation(t *testing.T) {
@@ -201,7 +207,7 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 	// Assert
 	assert.NoError(t, err)
 	assert.Equal(t, 1, state.GetCount(), "Cue should run exactly once")
-	assert.Equal(t, []string{"OneShot"}, result.CompletedCues)
+	assert.Equal(t, "OneShot", result.CompletedCues[0].Name)
 }
 
 func TestDeck_Run_Concurrency_Race(t *testing.T) {
@@ -294,6 +300,7 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 		Name: "CueA",
 		When: func(s *TestState) bool { return s.Count == 0 },
 		Run: func(s *TestState) (func(*TestState), error) {
+			time.Sleep(10 * time.Millisecond) // Simulate work
 			return func(s *TestState) { s.Inc() }, nil
 		},
 	}
@@ -302,6 +309,7 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 		Name: "CueB",
 		When: func(s *TestState) bool { return s.Count == 1 },
 		Run: func(s *TestState) (func(*TestState), error) {
+			time.Sleep(20 * time.Millisecond) // Simulate work
 			return func(s *TestState) { s.Inc() }, nil
 		},
 	}
@@ -310,14 +318,35 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 	assert.NoError(t, err)
 
 	// Act
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
 	result, err := sut.Run(ctx, state)
 
 	// Assert
 	assert.NoError(t, err)
-	assert.ElementsMatch(t, []string{"CueA", "CueB"}, result.CompletedCues)
+
+	// Verify names
+	var names []string
+	for _, c := range result.CompletedCues {
+		names = append(names, c.Name)
+	}
+	assert.ElementsMatch(t, []string{"CueA", "CueB"}, names)
+
+	// Verify timings
+	for _, c := range result.CompletedCues {
+		assert.False(t, c.StartTime.IsZero(), "StartTime should be set")
+		assert.False(t, c.EndTime.IsZero(), "EndTime should be set")
+		assert.True(t, c.EndTime.After(c.StartTime), "EndTime should be after StartTime")
+		assert.True(t, c.Duration() > 0, "Duration should be positive")
+
+		if c.Name == "CueA" {
+			assert.True(t, c.Duration() >= 10*time.Millisecond, "CueA duration should be at least 10ms")
+		}
+		if c.Name == "CueB" {
+			assert.True(t, c.Duration() >= 20*time.Millisecond, "CueB duration should be at least 20ms")
+		}
+	}
 }
 
 func assertExecutionOrder(t *testing.T, state *TestState, order ...string) {
