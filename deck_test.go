@@ -13,9 +13,8 @@ import (
 
 // TestState is now unsafe (no mutex) to demonstrate race conditions
 type TestState struct {
-	Count           int
-	CompletionTimes map[string]time.Time
-	Buffer          []rune
+	Count  int
+	Buffer []rune
 }
 
 func (s *TestState) Inc() {
@@ -24,18 +23,6 @@ func (s *TestState) Inc() {
 
 func (s *TestState) GetCount() int {
 	return s.Count
-}
-
-func (s *TestState) RecordCompletion(name string) {
-	if s.CompletionTimes == nil {
-		s.CompletionTimes = make(map[string]time.Time)
-	}
-	s.CompletionTimes[name] = time.Now()
-}
-
-func (s *TestState) GetCompletionTime(name string) (time.Time, bool) {
-	t, ok := s.CompletionTimes[name]
-	return t, ok
 }
 
 func (s *TestState) Append(r rune) {
@@ -79,8 +66,7 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 func TestDeck_Run_ChainReaction(t *testing.T) {
 	// Arrange
 	state := &TestState{
-		Count:           0,
-		CompletionTimes: make(map[string]time.Time),
+		Count: 0,
 	}
 
 	// Cue 1: 0 -> 1
@@ -94,7 +80,6 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 			time.Sleep(1 * time.Millisecond)
 			return func(s *TestState) {
 				s.Inc()
-				state.RecordCompletion("cue1")
 			}, nil
 		},
 	}
@@ -108,7 +93,6 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 		Run: func(s *TestState) (func(*TestState), error) {
 			return func(s *TestState) {
 				s.Inc()
-				state.RecordCompletion("cue2")
 			}, nil
 		},
 	}
@@ -126,7 +110,7 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 2, state.GetCount(), "Count should be incremented to 2 via chain reaction")
 
-	assertExecutionOrder(t, state, "cue1", "cue2")
+	assertExecutionOrder(t, result, "cue1", "cue2")
 
 	// Verify names in result
 	var names []string
@@ -349,18 +333,25 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 	}
 }
 
-func assertExecutionOrder(t *testing.T, state *TestState, order ...string) {
+func assertExecutionOrder(t *testing.T, result deck.Result, order ...string) {
 	t.Helper()
+
+	// Create a map of cue name to index in completed list
+	indices := make(map[string]int)
+	for i, c := range result.CompletedCues {
+		indices[c.Name] = i
+	}
+
 	for i := 0; i < len(order)-1; i++ {
 		currKey := order[i]
 		nextKey := order[i+1]
 
-		currTime, ok1 := state.GetCompletionTime(currKey)
-		nextTime, ok2 := state.GetCompletionTime(nextKey)
+		idx1, ok1 := indices[currKey]
+		idx2, ok2 := indices[nextKey]
 
 		if assert.True(t, ok1, "Cue %s should have completed", currKey) &&
 			assert.True(t, ok2, "Cue %s should have completed", nextKey) {
-			assert.True(t, currTime.Before(nextTime), "Cue %s should complete before %s", currKey, nextKey)
+			assert.True(t, idx1 < idx2, "Cue %s should complete before %s", currKey, nextKey)
 		}
 	}
 }
