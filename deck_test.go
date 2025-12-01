@@ -47,10 +47,8 @@ func (s *TestState) GetCompletionTime(name string) (time.Time, bool) {
 func TestDeck_Run_HappyPath(t *testing.T) {
 	// Arrange
 	state := &TestState{Count: 1}
-	sut := deck.New(state)
 
-	// Add a cue that increments the count if it's 0
-	sut.AddCue(deck.Cue[TestState]{
+	cue := deck.Cue[TestState]{
 		When: func(s *TestState) bool {
 			return s.GetCount() == 1
 		},
@@ -58,7 +56,9 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 			s.Inc()
 			return nil
 		},
-	})
+	}
+
+	sut := deck.New(state, cue)
 
 	// Act
 	// Run for a short duration to allow the loop to execute
@@ -78,10 +78,9 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 		Count:           0,
 		CompletionTimes: make(map[string]time.Time),
 	}
-	sut := deck.New(state)
 
 	// Cue 1: 0 -> 1
-	sut.AddCue(deck.Cue[TestState]{
+	cue1 := deck.Cue[TestState]{
 		When: func(s *TestState) bool {
 			return s.GetCount() == 0
 		},
@@ -92,10 +91,10 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 			time.Sleep(1 * time.Millisecond)
 			return nil
 		},
-	})
+	}
 
 	// Cue 2: 1 -> 2
-	sut.AddCue(deck.Cue[TestState]{
+	cue2 := deck.Cue[TestState]{
 		When: func(s *TestState) bool {
 			return s.GetCount() == 1
 		},
@@ -104,7 +103,9 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 			state.RecordCompletion("cue2")
 			return nil
 		},
-	})
+	}
+
+	sut := deck.New(state, cue1, cue2)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -122,10 +123,9 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 func TestDeck_Run_Cancellation(t *testing.T) {
 	// Arrange
 	state := &TestState{Count: 0}
-	sut := deck.New(state)
 
 	// Add a cue that sleeps for a long time
-	sut.AddCue(deck.Cue[TestState]{
+	cue := deck.Cue[TestState]{
 		When: func(s *TestState) bool {
 			return true
 		},
@@ -133,7 +133,9 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 			time.Sleep(200 * time.Millisecond)
 			return nil
 		},
-	})
+	}
+
+	sut := deck.New(state, cue)
 
 	// Act
 	ctx, cancel := context.WithCancel(context.Background())
@@ -155,6 +157,34 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 		assert.Fail(t, "Run did not return after cancellation")
 	}
+}
+
+func TestDeck_Run_SingleExecution(t *testing.T) {
+	// Arrange
+	state := &TestState{Count: 0}
+
+	// Add a cue that is always true
+	cue := deck.Cue[TestState]{
+		When: func(s *TestState) bool {
+			return true
+		},
+		Run: func(s *TestState) error {
+			s.Inc()
+			return nil
+		},
+	}
+
+	sut := deck.New(state, cue)
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	err := sut.Run(ctx)
+
+	// Assert
+	assert.NoError(t, err)
+	assert.Equal(t, 1, state.GetCount(), "Cue should run exactly once")
 }
 
 func assertExecutionOrder(t *testing.T, state *TestState, order ...string) {

@@ -18,16 +18,12 @@ type Cue[S any] struct {
 	Run func(*S) error
 }
 
-// New creates a new Deck with the given initial state.
-func New[S any](state *S) *Deck[S] {
+// New creates a new Deck with the given initial state and cues.
+func New[S any](state *S, cues ...Cue[S]) *Deck[S] {
 	return &Deck[S]{
 		state: state,
+		cues:  cues,
 	}
-}
-
-// AddCue adds a new agent to the Deck.
-func (d *Deck[S]) AddCue(c Cue[S]) {
-	d.cues = append(d.cues, c)
 }
 
 // Run starts the Deck loop. It continues until the context is cancelled.
@@ -90,10 +86,8 @@ func (d *Deck[S]) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case c := <-done:
+		case <-done:
 			activeCount--
-			// Return the completed cue to pending so it can be checked again later
-			pending = append(pending, c)
 		}
 	}
 }
