@@ -10,7 +10,8 @@ import (
 )
 
 type TestState struct {
-	Count int
+	Count           int
+	CompletionTimes map[string]time.Time
 }
 
 func TestDeck_Run_HappyPath(t *testing.T) {
@@ -43,7 +44,10 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 
 func TestDeck_Run_ChainReaction(t *testing.T) {
 	// Arrange
-	state := &TestState{Count: 0}
+	state := &TestState{
+		Count:           0,
+		CompletionTimes: make(map[string]time.Time),
+	}
 	sut := deck.New(state)
 
 	// Cue 1: 0 -> 1
@@ -53,6 +57,9 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 		},
 		Run: func(s *TestState) error {
 			s.Count++
+			state.CompletionTimes["cue1"] = time.Now()
+			// Ensure some time passes so timestamps are distinct
+			time.Sleep(1 * time.Millisecond)
 			return nil
 		},
 	})
@@ -64,6 +71,7 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 		},
 		Run: func(s *TestState) error {
 			s.Count++
+			state.CompletionTimes["cue2"] = time.Now()
 			return nil
 		},
 	})
@@ -77,4 +85,22 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	// Assert
 	assert.NoError(t, err)
 	assert.Equal(t, 2, state.Count, "Count should be incremented to 2 via chain reaction")
+
+	assertExecutionOrder(t, state.CompletionTimes, "cue1", "cue2")
+}
+
+func assertExecutionOrder(t *testing.T, times map[string]time.Time, order ...string) {
+	t.Helper()
+	for i := 0; i < len(order)-1; i++ {
+		currKey := order[i]
+		nextKey := order[i+1]
+
+		currTime, ok1 := times[currKey]
+		nextTime, ok2 := times[nextKey]
+
+		if assert.True(t, ok1, "Cue %s should have completed", currKey) &&
+			assert.True(t, ok2, "Cue %s should have completed", nextKey) {
+			assert.True(t, currTime.Before(nextTime), "Cue %s should complete before %s", currKey, nextKey)
+		}
+	}
 }
