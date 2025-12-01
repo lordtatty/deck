@@ -30,6 +30,9 @@ func New[S any](cues ...Cue[S]) (*Deck[S], error) {
 		if c.Name == "" {
 			return nil, fmt.Errorf("cue name cannot be empty")
 		}
+		if c.Run == nil {
+			return nil, fmt.Errorf("cue run cannot be nil: %s", c.Name)
+		}
 		if seen[c.Name] {
 			return nil, fmt.Errorf("duplicate cue name: %s", c.Name)
 		}

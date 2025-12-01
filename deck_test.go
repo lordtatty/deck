@@ -276,6 +276,22 @@ func TestDeck_New_EmptyName(t *testing.T) {
 	assert.Contains(t, err.Error(), "cue name cannot be empty")
 }
 
+func TestDeck_New_NilRun(t *testing.T) {
+	// Arrange
+	cue := deck.Cue[TestState]{
+		Name: "NilRunCue",
+		When: nil,
+		Run:  nil,
+	}
+
+	// Act
+	_, err := deck.New(cue)
+
+	// Assert
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cue run cannot be nil: NilRunCue")
+}
+
 func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 	// Arrange
 	state := &TestState{Count: 0}
