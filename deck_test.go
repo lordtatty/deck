@@ -40,3 +40,41 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 2, state.Count, "Count should be incremented to 2")
 }
+
+func TestDeck_Run_ChainReaction(t *testing.T) {
+	// Arrange
+	state := &TestState{Count: 0}
+	sut := deck.New(state)
+
+	// Cue 1: 0 -> 1
+	sut.AddCue(deck.Cue[TestState]{
+		When: func(s *TestState) bool {
+			return s.Count == 0
+		},
+		Run: func(s *TestState) error {
+			s.Count++
+			return nil
+		},
+	})
+
+	// Cue 2: 1 -> 2
+	sut.AddCue(deck.Cue[TestState]{
+		When: func(s *TestState) bool {
+			return s.Count == 1
+		},
+		Run: func(s *TestState) error {
+			s.Count++
+			return nil
+		},
+	})
+
+	// Act
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	err := sut.Run(ctx)
+
+	// Assert
+	assert.NoError(t, err)
+	assert.Equal(t, 2, state.Count, "Count should be incremented to 2 via chain reaction")
+}

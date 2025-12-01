@@ -2,7 +2,6 @@ package deck
 
 import (
 	"context"
-	"time"
 )
 
 // Deck manages a set of agents (Cues) that operate on a shared state.
@@ -33,20 +32,25 @@ func (d *Deck[S]) AddCue(c Cue[S]) {
 
 // Run starts the Deck loop. It continues until the context is cancelled.
 func (d *Deck[S]) Run(ctx context.Context) error {
-	ticker := time.NewTicker(1 * time.Millisecond)
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
+		default:
+			// Check if any cue needs to run
+			anyRun := false
 			for _, c := range d.cues {
 				if c.When(d.state) {
 					if err := c.Run(d.state); err != nil {
 						return err
 					}
+					anyRun = true
 				}
+			}
+
+			// If no cue ran, we are done for this pass
+			if !anyRun {
+				return nil
 			}
 		}
 	}
