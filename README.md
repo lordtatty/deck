@@ -1,6 +1,6 @@
 # Deck
 
-A streamlined Go package for orchestrating concurrent, state-driven agent execution.
+[![Test](https://github.com/lordtatty/deck/actions/workflows/test.yml/badge.svg)](https://github.com/lordtatty/deck/actions/workflows/test.yml)
 
 ## Key Concepts
 
