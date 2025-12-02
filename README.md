@@ -1,6 +1,6 @@
 # Deck
 
-[![Test](https://github.com/lordtatty/deck/actions/workflows/test.yml/badge.svg)](https://github.com/lordtatty/deck/actions/workflows/test.yml)
+[![Test](https://github.com/lordtatty/deck/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/lordtatty/deck/actions/workflows/test.yml)
 
 ## Key Concepts
 
