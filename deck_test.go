@@ -40,10 +40,10 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 		When: func(s TestState, r deck.Result) bool {
 			return s.GetCount() == 1
 		},
-		Run: func(s TestState) (func(*TestState), error) {
-			return func(s *TestState) {
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) {
 				s.Inc()
-			}, nil
+			}), nil
 		},
 	}
 
@@ -75,12 +75,12 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 		When: func(s TestState, r deck.Result) bool {
 			return s.GetCount() == 0
 		},
-		Run: func(s TestState) (func(*TestState), error) {
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
 			// Ensure some time passes so timestamps are distinct
 			time.Sleep(1 * time.Millisecond)
-			return func(s *TestState) {
+			return deck.Complete(func(s *TestState) {
 				s.Inc()
-			}, nil
+			}), nil
 		},
 	}
 
@@ -90,10 +90,10 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 		When: func(s TestState, r deck.Result) bool {
 			return s.GetCount() == 1
 		},
-		Run: func(s TestState) (func(*TestState), error) {
-			return func(s *TestState) {
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) {
 				s.Inc()
-			}, nil
+			}), nil
 		},
 	}
 
@@ -130,7 +130,7 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 		When: func(s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s TestState) (func(*TestState), error) {
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
 			time.Sleep(200 * time.Millisecond)
 			return nil, nil
 		},
@@ -172,10 +172,10 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 		When: func(s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s TestState) (func(*TestState), error) {
-			return func(s *TestState) {
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) {
 				s.Inc()
-			}, nil
+			}), nil
 		},
 	}
 
@@ -212,13 +212,13 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 			When: func(s TestState, r deck.Result) bool {
 				return true
 			},
-			Run: func(s TestState) (func(*TestState), error) {
+			Run: func(s TestState) (deck.Mutation[TestState], error) {
 				// Return mutation function that streams the alphabet
-				return func(s *TestState) {
+				return deck.Complete(func(s *TestState) {
 					for _, r := range alphabet {
 						s.Append(r)
 					}
-				}, nil
+				}), nil
 			},
 		}
 	}
@@ -244,12 +244,12 @@ func TestDeck_New_DuplicateNames(t *testing.T) {
 	cue1 := deck.Cue[TestState]{
 		Name: "Duplicate",
 		When: func(s TestState, r deck.Result) bool { return true },
-		Run:  func(s TestState) (func(*TestState), error) { return nil, nil },
+		Run:  func(s TestState) (deck.Mutation[TestState], error) { return nil, nil },
 	}
 	cue2 := deck.Cue[TestState]{
 		Name: "Duplicate",
 		When: func(s TestState, r deck.Result) bool { return true },
-		Run:  func(s TestState) (func(*TestState), error) { return nil, nil },
+		Run:  func(s TestState) (deck.Mutation[TestState], error) { return nil, nil },
 	}
 
 	// Act
@@ -265,7 +265,7 @@ func TestDeck_New_EmptyName(t *testing.T) {
 	cue := deck.Cue[TestState]{
 		Name: "",
 		When: func(s TestState, r deck.Result) bool { return true },
-		Run:  func(s TestState) (func(*TestState), error) { return nil, nil },
+		Run:  func(s TestState) (deck.Mutation[TestState], error) { return nil, nil },
 	}
 
 	// Act
@@ -299,18 +299,18 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 	cue1 := deck.Cue[TestState]{
 		Name: "CueA",
 		When: func(s TestState, r deck.Result) bool { return s.Count == 0 },
-		Run: func(s TestState) (func(*TestState), error) {
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
 			time.Sleep(10 * time.Millisecond) // Simulate work
-			return func(s *TestState) { s.Inc() }, nil
+			return deck.Complete(func(s *TestState) { s.Inc() }), nil
 		},
 	}
 
 	cue2 := deck.Cue[TestState]{
 		Name: "CueB",
 		When: func(s TestState, r deck.Result) bool { return s.Count == 1 },
-		Run: func(s TestState) (func(*TestState), error) {
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
 			time.Sleep(20 * time.Millisecond) // Simulate work
-			return func(s *TestState) { s.Inc() }, nil
+			return deck.Complete(func(s *TestState) { s.Inc() }), nil
 		},
 	}
 
@@ -356,8 +356,8 @@ func TestDeck_Run_TriggerOnHistory(t *testing.T) {
 	cue1 := deck.Cue[TestState]{
 		Name: "CueA",
 		When: func(s TestState, r deck.Result) bool { return s.Count == 0 },
-		Run: func(s TestState) (func(*TestState), error) {
-			return func(s *TestState) { s.Inc() }, nil
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) { s.Inc() }), nil
 		},
 	}
 
@@ -367,8 +367,8 @@ func TestDeck_Run_TriggerOnHistory(t *testing.T) {
 			// Trigger only if CueA has completed
 			return r.Completed("CueA")
 		},
-		Run: func(s TestState) (func(*TestState), error) {
-			return func(s *TestState) { s.Inc() }, nil
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) { s.Inc() }), nil
 		},
 	}
 
@@ -398,13 +398,13 @@ func TestDeck_StateImmutability(t *testing.T) {
 			s.Count = 999
 			return true
 		},
-		Run: func(s TestState) (func(*TestState), error) {
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
 			// Attempt to modify state in Run (should be a copy)
 			s.Count = 888
-			return func(s *TestState) {
+			return deck.Complete(func(s *TestState) {
 				// Only this mutation should affect the real state
 				s.Inc()
-			}, nil
+			}), nil
 		},
 	}
 
@@ -435,12 +435,12 @@ func TestDeck_Run_ExternalModification(t *testing.T) {
 		When: func(s TestState, r deck.Result) bool {
 			return s.Count == 0
 		},
-		Run: func(s TestState) (func(*TestState), error) {
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
 			close(started)
 			<-continueChan
-			return func(s *TestState) {
+			return deck.Complete(func(s *TestState) {
 				s.Inc()
-			}, nil
+			}), nil
 		},
 	}
 
@@ -488,10 +488,10 @@ func TestDeck_Run_NilWhen(t *testing.T) {
 	cue := deck.Cue[TestState]{
 		Name: "AlwaysRun",
 		When: nil, // Should default to true
-		Run: func(s TestState) (func(*TestState), error) {
-			return func(s *TestState) {
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) {
 				s.Inc()
-			}, nil
+			}), nil
 		},
 	}
 
@@ -508,6 +508,627 @@ func TestDeck_Run_NilWhen(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 1, state.Count, "Cue with nil When should run")
 	assert.Equal(t, "AlwaysRun", result.CompletedCues[0].Name)
+}
+
+func TestDeck_Run_Suspend_MutationAppliedButNotCompleted(t *testing.T) {
+	// Given a cue that returns a Suspended mutation
+	state := &TestState{Count: 0}
+
+	cue := deck.Cue[TestState]{
+		Name: "SuspendingCue",
+		When: func(s TestState, r deck.Result) bool {
+			return s.Count == 0
+		},
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Suspended(func(s *TestState) {
+				s.Count = 42
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs
+	result, err := sut.Run(ctx, state)
+
+	// Then the mutation is applied
+	assert.NoError(t, err)
+	assert.Equal(t, 42, state.Count, "Suspended mutation should still be applied to state")
+
+	// And the cue is NOT in CompletedCues
+	assert.False(t, result.Completed("SuspendingCue"), "Suspended cue should not appear in completed cues")
+
+	// And the result indicates suspension
+	assert.True(t, result.Suspended, "Result should indicate the deck was suspended")
+}
+
+func TestDeck_Run_Suspend_OtherCuesDrainBeforeReturning(t *testing.T) {
+	// Given a cue that suspends and another cue that runs normally
+	state := &TestState{Count: 0}
+
+	suspendCue := deck.Cue[TestState]{
+		Name: "Suspender",
+		When: func(s TestState, r deck.Result) bool {
+			return true
+		},
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Suspended(func(s *TestState) {
+				s.Count += 10
+			}), nil
+		},
+	}
+
+	normalCue := deck.Cue[TestState]{
+		Name: "Normal",
+		When: func(s TestState, r deck.Result) bool {
+			return true
+		},
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			time.Sleep(20 * time.Millisecond) // takes a bit longer
+			return deck.Complete(func(s *TestState) {
+				s.Count += 1
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(suspendCue, normalCue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs
+	result, err := sut.Run(ctx, state)
+
+	// Then both mutations are applied
+	assert.NoError(t, err)
+	assert.Equal(t, 11, state.Count, "Both mutations should be applied")
+
+	// And the normal cue completed
+	assert.True(t, result.Completed("Normal"), "Normal cue should be completed")
+
+	// And the suspending cue did not complete
+	assert.False(t, result.Completed("Suspender"), "Suspender should not be completed")
+
+	// And the result indicates suspension
+	assert.True(t, result.Suspended)
+}
+
+func TestDeck_Resume_SkipsPreviouslyCompletedCues(t *testing.T) {
+	// Given a deck where CueA has already completed
+	state := &TestState{Count: 1}
+
+	cueA := deck.Cue[TestState]{
+		Name: "CueA",
+		When: func(s TestState, r deck.Result) bool {
+			return true // would fire if not already completed
+		},
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) {
+				s.Count += 100 // should NOT happen on resume
+			}), nil
+		},
+	}
+
+	cueB := deck.Cue[TestState]{
+		Name: "CueB",
+		When: func(s TestState, r deck.Result) bool {
+			return r.Completed("CueA")
+		},
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) {
+				s.Count += 1
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cueA, cueB)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// When we resume with CueA already completed
+	prev := deck.Result{
+		CompletedCues: []deck.CompletedCue{{Name: "CueA"}},
+	}
+	result, err := sut.Run(ctx, state, prev)
+
+	// Then CueA does not re-run (count would be 101+ if it did)
+	assert.NoError(t, err)
+	assert.Equal(t, 2, state.Count, "Only CueB should have run")
+
+	// And both cues appear in completed
+	assert.True(t, result.Completed("CueA"), "CueA should still be in completed")
+	assert.True(t, result.Completed("CueB"), "CueB should be in completed")
+}
+
+func TestDeck_Resume_SuspendAndResumeTwoCuePattern(t *testing.T) {
+	// Given two cues: one to submit a batch, one to check the result
+	type BatchState struct {
+		BatchID string
+		Result  string
+	}
+
+	submitCue := deck.Cue[BatchState]{
+		Name: "SubmitBatch",
+		When: func(s BatchState, r deck.Result) bool {
+			return s.BatchID == ""
+		},
+		Run: func(s BatchState) (deck.Mutation[BatchState], error) {
+			return deck.Suspended(func(s *BatchState) {
+				s.BatchID = "batch-123"
+			}), nil
+		},
+	}
+
+	checkCue := deck.Cue[BatchState]{
+		Name: "CheckBatch",
+		When: func(s BatchState, r deck.Result) bool {
+			return s.BatchID != "" && s.Result == ""
+		},
+		Run: func(s BatchState) (deck.Mutation[BatchState], error) {
+			return deck.Complete(func(s *BatchState) {
+				s.Result = "done"
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(submitCue, checkCue)
+	assert.NoError(t, err)
+
+	ctx := context.Background()
+
+	// First run: SubmitBatch fires and suspends
+	state := &BatchState{}
+	result1, err := sut.Run(ctx, state)
+	assert.NoError(t, err)
+	assert.True(t, result1.Suspended)
+	assert.Equal(t, "batch-123", state.BatchID)
+	assert.Equal(t, "", state.Result)
+	// SubmitBatch should not be in completed (it suspended)
+	assert.False(t, result1.Completed("SubmitBatch"))
+
+	// Resume: SubmitBatch won't fire (BatchID != ""), CheckBatch fires
+	result2, err := sut.Run(ctx, state, result1)
+	assert.NoError(t, err)
+	assert.False(t, result2.Suspended)
+	assert.Equal(t, "done", state.Result)
+	assert.True(t, result2.Completed("CheckBatch"))
+}
+
+func TestDeck_Resume_FullLifecycleWithMultipleCues(t *testing.T) {
+	// Given a deck with three cues: one completes normally, one suspends, one depends on the suspended work
+	type WorkState struct {
+		SetupDone bool
+		BatchID   string
+		Result    string
+	}
+
+	setupCue := deck.Cue[WorkState]{
+		Name: "Setup",
+		When: func(s WorkState, r deck.Result) bool {
+			return !s.SetupDone
+		},
+		Run: func(s WorkState) (deck.Mutation[WorkState], error) {
+			return deck.Complete(func(s *WorkState) {
+				s.SetupDone = true
+			}), nil
+		},
+	}
+
+	batchCue := deck.Cue[WorkState]{
+		Name: "SubmitBatch",
+		When: func(s WorkState, r deck.Result) bool {
+			return s.SetupDone && s.BatchID == ""
+		},
+		Run: func(s WorkState) (deck.Mutation[WorkState], error) {
+			return deck.Suspended(func(s *WorkState) {
+				s.BatchID = "batch-456"
+			}), nil
+		},
+	}
+
+	collectCue := deck.Cue[WorkState]{
+		Name: "CollectResult",
+		When: func(s WorkState, r deck.Result) bool {
+			return s.BatchID != "" && s.Result == ""
+		},
+		Run: func(s WorkState) (deck.Mutation[WorkState], error) {
+			return deck.Complete(func(s *WorkState) {
+				s.Result = "collected"
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(setupCue, batchCue, collectCue)
+	assert.NoError(t, err)
+
+	ctx := context.Background()
+
+	// First run: Setup completes, SubmitBatch fires and suspends
+	state := &WorkState{}
+	result1, err := sut.Run(ctx, state)
+	assert.NoError(t, err)
+	assert.True(t, result1.Suspended)
+	assert.True(t, state.SetupDone)
+	assert.Equal(t, "batch-456", state.BatchID)
+	assert.True(t, result1.Completed("Setup"), "Setup should be completed")
+	assert.False(t, result1.Completed("SubmitBatch"), "SubmitBatch suspended, not completed")
+
+	// Resume: Setup already completed (skipped), SubmitBatch won't match (BatchID set),
+	// CollectResult fires
+	result2, err := sut.Run(ctx, state, result1)
+	assert.NoError(t, err)
+	assert.False(t, result2.Suspended)
+	assert.Equal(t, "collected", state.Result)
+	assert.True(t, result2.Completed("Setup"), "Setup should carry over from previous result")
+	assert.True(t, result2.Completed("CollectResult"), "CollectResult should be completed")
+}
+
+func TestDeck_Run_Suspend_NonSuspendedMutationWorksAsNormal(t *testing.T) {
+	// Given a cue that returns a normal (non-suspended) mutation
+	state := &TestState{Count: 0}
+
+	cue := deck.Cue[TestState]{
+		Name: "NormalCue",
+		When: func(s TestState, r deck.Result) bool {
+			return true
+		},
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) {
+				s.Count = 5
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs
+	result, err := sut.Run(ctx, state)
+
+	// Then it completes normally with no suspension
+	assert.NoError(t, err)
+	assert.Equal(t, 5, state.Count)
+	assert.True(t, result.Completed("NormalCue"))
+	assert.False(t, result.Suspended, "Result should not be suspended for normal cues")
+}
+
+func TestDeck_Export_ProducesValidJSON(t *testing.T) {
+	// Given a deck that suspends with some state
+	type JobState struct {
+		BatchID string `json:"batch_id"`
+		Result  string `json:"result"`
+	}
+
+	cue := deck.Cue[JobState]{
+		Name: "Submit",
+		When: func(s JobState, r deck.Result) bool { return s.BatchID == "" },
+		Run: func(s JobState) (deck.Mutation[JobState], error) {
+			return deck.Suspended(func(s *JobState) {
+				s.BatchID = "batch-789"
+			}), nil
+		},
+	}
+
+	d, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	state := &JobState{}
+	result, err := d.Run(context.Background(), state)
+	assert.NoError(t, err)
+	assert.True(t, result.Suspended)
+
+	// When we export
+	data, err := d.Export(state, result)
+
+	// Then it succeeds and produces valid JSON
+	assert.NoError(t, err)
+	assert.NotEmpty(t, data)
+
+	// And the JSON contains the state and result
+	assert.Contains(t, string(data), `"batch_id":"batch-789"`)
+	assert.Contains(t, string(data), `"suspended":true`)
+}
+
+func TestDeck_Import_RoundTrip(t *testing.T) {
+	// Given a deck with submit and collect cues
+	type JobState struct {
+		BatchID string `json:"batch_id"`
+		Result  string `json:"result"`
+	}
+
+	submitCue := deck.Cue[JobState]{
+		Name: "Submit",
+		When: func(s JobState, r deck.Result) bool { return s.BatchID == "" },
+		Run: func(s JobState) (deck.Mutation[JobState], error) {
+			return deck.Suspended(func(s *JobState) {
+				s.BatchID = "batch-abc"
+			}), nil
+		},
+	}
+
+	collectCue := deck.Cue[JobState]{
+		Name: "Collect",
+		When: func(s JobState, r deck.Result) bool {
+			return s.BatchID != "" && s.Result == ""
+		},
+		Run: func(s JobState) (deck.Mutation[JobState], error) {
+			return deck.Complete(func(s *JobState) {
+				s.Result = "collected"
+			}), nil
+		},
+	}
+
+	d, err := deck.New(submitCue, collectCue)
+	assert.NoError(t, err)
+
+	// First run: suspends after submit
+	state := &JobState{}
+	result1, err := d.Run(context.Background(), state)
+	assert.NoError(t, err)
+	assert.True(t, result1.Suspended)
+	assert.Equal(t, "batch-abc", state.BatchID)
+
+	// Export the state
+	data, err := d.Export(state, result1)
+	assert.NoError(t, err)
+
+	// Import restores state and previous result
+	importedState, prev, err := d.Import(data)
+	assert.NoError(t, err)
+	assert.Equal(t, "batch-abc", importedState.BatchID)
+	assert.True(t, prev.Suspended)
+
+	// When we resume using the imported data
+	result2, err := d.Run(context.Background(), importedState, prev)
+
+	// Then it completes successfully
+	assert.NoError(t, err)
+	assert.False(t, result2.Suspended)
+	assert.Equal(t, "batch-abc", importedState.BatchID)
+	assert.Equal(t, "collected", importedState.Result)
+	assert.True(t, result2.Completed("Collect"))
+}
+
+func TestDeck_Import_InvalidJSON(t *testing.T) {
+	// Given a deck
+	cue := deck.Cue[TestState]{
+		Name: "Cue",
+		When: func(s TestState, r deck.Result) bool { return true },
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) {}), nil
+		},
+	}
+
+	d, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	// When we try to import invalid data
+	_, _, err = d.Import([]byte("not json"))
+
+	// Then it returns an error
+	assert.Error(t, err)
+}
+
+func TestDeck_Import_FullLifecycle(t *testing.T) {
+	// Given a deck with setup, two concurrent suspenders, and a final assembly cue
+	type PipelineState struct {
+		Ready    bool   `json:"ready"`
+		ImageID  string `json:"image_id"`
+		ImageURL string `json:"image_url"`
+		CopyID   string `json:"copy_id"`
+		CopyText string `json:"copy_text"`
+		Output   string `json:"output"`
+	}
+
+	setupCue := deck.Cue[PipelineState]{
+		Name: "Setup",
+		When: func(s PipelineState, r deck.Result) bool { return !s.Ready },
+		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+			return deck.Complete(func(s *PipelineState) { s.Ready = true }), nil
+		},
+	}
+
+	submitImage := deck.Cue[PipelineState]{
+		Name: "SubmitImage",
+		When: func(s PipelineState, r deck.Result) bool {
+			return s.Ready && s.ImageID == ""
+		},
+		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+			return deck.Suspended(func(s *PipelineState) {
+				s.ImageID = "img-001"
+			}), nil
+		},
+	}
+
+	submitCopy := deck.Cue[PipelineState]{
+		Name: "SubmitCopy",
+		When: func(s PipelineState, r deck.Result) bool {
+			return s.Ready && s.CopyID == ""
+		},
+		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+			return deck.Suspended(func(s *PipelineState) {
+				s.CopyID = "copy-001"
+			}), nil
+		},
+	}
+
+	collectImage := deck.Cue[PipelineState]{
+		Name: "CollectImage",
+		When: func(s PipelineState, r deck.Result) bool {
+			return s.ImageID != "" && s.ImageURL == ""
+		},
+		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+			return deck.Complete(func(s *PipelineState) {
+				s.ImageURL = "https://example.com/img.png"
+			}), nil
+		},
+	}
+
+	collectCopy := deck.Cue[PipelineState]{
+		Name: "CollectCopy",
+		When: func(s PipelineState, r deck.Result) bool {
+			return s.CopyID != "" && s.CopyText == ""
+		},
+		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+			return deck.Complete(func(s *PipelineState) {
+				s.CopyText = "Great article about Go"
+			}), nil
+		},
+	}
+
+	assembleCue := deck.Cue[PipelineState]{
+		Name: "Assemble",
+		When: func(s PipelineState, r deck.Result) bool {
+			return s.ImageURL != "" && s.CopyText != "" && s.Output == ""
+		},
+		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+			return deck.Complete(func(s *PipelineState) {
+				s.Output = s.CopyText + " [" + s.ImageURL + "]"
+			}), nil
+		},
+	}
+
+	d, err := deck.New(setupCue, submitImage, submitCopy, collectImage, collectCopy, assembleCue)
+	assert.NoError(t, err)
+
+	ctx := context.Background()
+
+	// Phase 1: Run — Setup completes, both submits suspend
+	state := &PipelineState{}
+	result1, err := d.Run(ctx, state)
+	assert.NoError(t, err)
+	assert.True(t, result1.Suspended)
+	assert.True(t, state.Ready)
+	assert.Equal(t, "img-001", state.ImageID)
+	assert.Equal(t, "copy-001", state.CopyID)
+
+	// Export
+	data, err := d.Export(state, result1)
+	assert.NoError(t, err)
+
+	// Phase 2: Import, then Resume — collects both results, assembles
+	importedState, prev, err := d.Import(data)
+	assert.NoError(t, err)
+
+	result2, err := d.Run(ctx, importedState, prev)
+	assert.NoError(t, err)
+	assert.False(t, result2.Suspended)
+	assert.Equal(t, "Great article about Go [https://example.com/img.png]", importedState.Output)
+	assert.True(t, result2.Completed("Setup"))
+	assert.True(t, result2.Completed("CollectImage"))
+	assert.True(t, result2.Completed("CollectCopy"))
+	assert.True(t, result2.Completed("Assemble"))
+}
+
+func TestDeck_Run_Suspend_TwoConcurrentSuspends(t *testing.T) {
+	// Given two cues that both suspend concurrently
+	type DualState struct {
+		BatchA string
+		BatchB string
+	}
+
+	cueA := deck.Cue[DualState]{
+		Name: "SubmitA",
+		When: func(s DualState, r deck.Result) bool {
+			return s.BatchA == ""
+		},
+		Run: func(s DualState) (deck.Mutation[DualState], error) {
+			time.Sleep(10 * time.Millisecond) // simulate work
+			return deck.Suspended(func(s *DualState) {
+				s.BatchA = "a-001"
+			}), nil
+		},
+	}
+
+	cueB := deck.Cue[DualState]{
+		Name: "SubmitB",
+		When: func(s DualState, r deck.Result) bool {
+			return s.BatchB == ""
+		},
+		Run: func(s DualState) (deck.Mutation[DualState], error) {
+			time.Sleep(10 * time.Millisecond) // simulate work
+			return deck.Suspended(func(s *DualState) {
+				s.BatchB = "b-001"
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cueA, cueB)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// When both cues fire concurrently and both suspend
+	state := &DualState{}
+	result, err := sut.Run(ctx, state)
+
+	// Then both mutations are applied
+	assert.NoError(t, err)
+	assert.Equal(t, "a-001", state.BatchA, "SubmitA mutation should be applied")
+	assert.Equal(t, "b-001", state.BatchB, "SubmitB mutation should be applied")
+
+	// And neither is marked as completed
+	assert.False(t, result.Completed("SubmitA"), "SubmitA should not be completed")
+	assert.False(t, result.Completed("SubmitB"), "SubmitB should not be completed")
+
+	// And the result indicates suspension
+	assert.True(t, result.Suspended)
+}
+
+func TestDeck_Run_Suspend_StatePreservedOnCancellation(t *testing.T) {
+	// Given a cue that suspends, and the context is cancelled during drain
+	state := &TestState{Count: 42}
+
+	suspendCue := deck.Cue[TestState]{
+		Name: "Suspender",
+		When: func(s TestState, r deck.Result) bool {
+			return true
+		},
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Suspended(func(s *TestState) {
+				s.Count = 99
+			}), nil
+		},
+	}
+
+	slowCue := deck.Cue[TestState]{
+		Name: "SlowCue",
+		When: func(s TestState, r deck.Result) bool {
+			return true
+		},
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			time.Sleep(500 * time.Millisecond) // will exceed context
+			return deck.Complete(func(s *TestState) {
+				s.Count = 999
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(suspendCue, slowCue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs and context expires during drain
+	_, runErr := sut.Run(ctx, state)
+
+	// Then an error is returned (context deadline exceeded)
+	assert.Error(t, runErr)
+
+	// And the original state is NOT modified (error means no copy-back)
+	assert.Equal(t, 42, state.Count, "State should be unchanged when Run returns an error")
 }
 
 func assertExecutionOrder(t *testing.T, result deck.Result, order ...string) {
