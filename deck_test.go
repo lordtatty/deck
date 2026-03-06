@@ -1030,6 +1030,107 @@ func TestDeck_Import_FullLifecycle(t *testing.T) {
 	assert.True(t, result2.Completed("Assemble"))
 }
 
+func TestDeck_Run_Suspend_TwoConcurrentSuspends(t *testing.T) {
+	// Given two cues that both suspend concurrently
+	type DualState struct {
+		BatchA string
+		BatchB string
+	}
+
+	cueA := deck.Cue[DualState]{
+		Name: "SubmitA",
+		When: func(s DualState, r deck.Result) bool {
+			return s.BatchA == ""
+		},
+		Run: func(s DualState) (deck.Mutation[DualState], error) {
+			time.Sleep(10 * time.Millisecond) // simulate work
+			return deck.Suspended(func(s *DualState) {
+				s.BatchA = "a-001"
+			}), nil
+		},
+	}
+
+	cueB := deck.Cue[DualState]{
+		Name: "SubmitB",
+		When: func(s DualState, r deck.Result) bool {
+			return s.BatchB == ""
+		},
+		Run: func(s DualState) (deck.Mutation[DualState], error) {
+			time.Sleep(10 * time.Millisecond) // simulate work
+			return deck.Suspended(func(s *DualState) {
+				s.BatchB = "b-001"
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cueA, cueB)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// When both cues fire concurrently and both suspend
+	state := &DualState{}
+	result, err := sut.Run(ctx, state)
+
+	// Then both mutations are applied
+	assert.NoError(t, err)
+	assert.Equal(t, "a-001", state.BatchA, "SubmitA mutation should be applied")
+	assert.Equal(t, "b-001", state.BatchB, "SubmitB mutation should be applied")
+
+	// And neither is marked as completed
+	assert.False(t, result.Completed("SubmitA"), "SubmitA should not be completed")
+	assert.False(t, result.Completed("SubmitB"), "SubmitB should not be completed")
+
+	// And the result indicates suspension
+	assert.True(t, result.Suspended)
+}
+
+func TestDeck_Run_Suspend_StatePreservedOnCancellation(t *testing.T) {
+	// Given a cue that suspends, and the context is cancelled during drain
+	state := &TestState{Count: 42}
+
+	suspendCue := deck.Cue[TestState]{
+		Name: "Suspender",
+		When: func(s TestState, r deck.Result) bool {
+			return true
+		},
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			return deck.Suspended(func(s *TestState) {
+				s.Count = 99
+			}), nil
+		},
+	}
+
+	slowCue := deck.Cue[TestState]{
+		Name: "SlowCue",
+		When: func(s TestState, r deck.Result) bool {
+			return true
+		},
+		Run: func(s TestState) (deck.Mutation[TestState], error) {
+			time.Sleep(500 * time.Millisecond) // will exceed context
+			return deck.Complete(func(s *TestState) {
+				s.Count = 999
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(suspendCue, slowCue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs and context expires during drain
+	_, runErr := sut.Run(ctx, state)
+
+	// Then an error is returned (context deadline exceeded)
+	assert.Error(t, runErr)
+
+	// And the original state is NOT modified (error means no copy-back)
+	assert.Equal(t, 42, state.Count, "State should be unchanged when Run returns an error")
+}
+
 func assertExecutionOrder(t *testing.T, result deck.Result, order ...string) {
 	t.Helper()
 
