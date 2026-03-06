@@ -112,16 +112,16 @@ func (r Result) Completed(name string) bool {
 	return false
 }
 
-// Snapshot bundles state and result for serialization between suspend/resume cycles.
-type Snapshot[S any] struct {
+// snapshot bundles state and result for serialization between suspend/resume cycles.
+type snapshot[S any] struct {
 	State  S      `json:"state"`
 	Result Result `json:"result"`
 }
 
 // Export serializes the current state and result into a portable byte slice
-// that can be stored externally and later passed to ResumeFromExport.
+// that can be stored externally and later passed to Import.
 func (d *Deck[S]) Export(state *S, result Result) ([]byte, error) {
-	snap := Snapshot[S]{State: *state, Result: result}
+	snap := snapshot[S]{State: *state, Result: result}
 	return json.Marshal(snap)
 }
 
@@ -129,7 +129,7 @@ func (d *Deck[S]) Export(state *S, result Result) ([]byte, error) {
 // and previous result. Use the returned values with Resume to continue
 // execution.
 func (d *Deck[S]) Import(data []byte) (*S, Result, error) {
-	var snap Snapshot[S]
+	var snap snapshot[S]
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return nil, Result{}, fmt.Errorf("failed to unmarshal snapshot: %w", err)
 	}

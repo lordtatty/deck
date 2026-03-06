@@ -130,7 +130,7 @@ func main() {
 	// Image generation completes after 1.5s
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
-		reqID := waitForField(ctx, rdb, jobID, "image_request_id")
+		reqID := waitForField(ctx, rdb, d, jobID, "image_request_id")
 		fmt.Printf("  [ImageGen API] Request %s complete, posting webhook\n", reqID)
 		rdb.Set(ctx, resultKey(reqID), "https://cdn.localhost/images/go-concurrency-hero.png", 0)
 		rdb.Publish(ctx, webhookChannel, fmt.Sprintf(`{"job_id":"%s","type":"image_complete"}`, jobID))
@@ -139,7 +139,7 @@ func main() {
 	// Copywriting completes after 3s
 	go func() {
 		time.Sleep(3000 * time.Millisecond)
-		reqID := waitForField(ctx, rdb, jobID, "copy_request_id")
+		reqID := waitForField(ctx, rdb, d, jobID, "copy_request_id")
 		fmt.Printf("  [CopyGen API] Request %s complete, posting webhook\n", reqID)
 		copyText := `Go's goroutines and channels make concurrent programming intuitive and safe. ` +
 			`Unlike thread-based models, Go's lightweight goroutines let you spin up thousands of ` +
@@ -375,18 +375,18 @@ func buildDeck(rdb *redis.Client) *deck.Deck[ContentState] {
 
 // waitForField polls a saved job's snapshot until a field is populated.
 // Simulates an external API looking up the request ID.
-func waitForField(ctx context.Context, rdb *redis.Client, jobID, field string) string {
+func waitForField(ctx context.Context, rdb *redis.Client, d *deck.Deck[ContentState], jobID, field string) string {
 	for {
 		data, err := rdb.Get(ctx, snapshotKey(jobID)).Bytes()
 		if err == nil {
-			var snap deck.Snapshot[ContentState]
-			if err := json.Unmarshal(data, &snap); err == nil {
+			state, _, importErr := d.Import(data)
+			if importErr == nil {
 				var val string
 				switch field {
 				case "image_request_id":
-					val = snap.State.ImageRequestID
+					val = state.ImageRequestID
 				case "copy_request_id":
-					val = snap.State.CopyRequestID
+					val = state.CopyRequestID
 				}
 				if val != "" {
 					return val
