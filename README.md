@@ -265,6 +265,57 @@ case "resume":
 result, err := d.Resume(ctx, state, prev)
 ```
 
+#### Building Safe Worker Flows
+
+When multiple cues suspend concurrently (e.g. an image API and a copywriting API both kick off batch jobs), multiple webhooks will arrive independently. There are two important things to understand:
+
+**Each resume runs the whole Deck, not just one cue.** When a webhook arrives and you resume, the Deck evaluates all pending cues. If the image result is ready but the copy result isn't, the image collect cue completes and the copy collect cue re-suspends. You don't need separate jobs per suspended cue — just resume the whole Deck each time any webhook arrives.
+
+**You must ensure mutual exclusion per job.** If two webhooks arrive simultaneously and two workers both load the same snapshot, you'll get duplicated work. Use a lock to ensure only one worker processes a given job ID at a time:
+
+```go
+// Webhook handler — acquire lock before re-enqueuing
+func handleWebhook(jobID string) {
+    // Store the result so the collect cue can find it
+    rdb.Set(ctx, resultKey(requestID), resultData, 0)
+
+    // Re-enqueue a resume job (the worker will acquire the lock)
+    enqueue(QueueMessage{Type: "resume", JobID: jobID})
+}
+
+// Worker — lock per job ID prevents concurrent processing
+func processJob(msg QueueMessage) {
+    lock := acquireLock(msg.JobID)
+    if lock == nil {
+        // Another worker is already processing this job.
+        // Re-enqueue so we retry after the lock is released.
+        enqueue(msg)
+        return
+    }
+    defer lock.Release()
+
+    state, prev, _ := d.Import(loadFromRedis(msg.JobID))
+    result, _ := d.Resume(ctx, state, prev)
+
+    if result.Suspended {
+        data, _ := d.Export(state, result)
+        saveToRedis(msg.JobID, data)
+        return // lock released, next webhook will re-enqueue
+    }
+
+    // Done — clean up
+    deleteFromRedis(msg.JobID)
+}
+```
+
+The typical flow with two concurrent suspends:
+
+1. Deck runs → both submit cues suspend → export snapshot
+2. Image webhook → worker acquires lock → resumes Deck → image collected, copy not ready → re-suspends → exports updated snapshot → releases lock
+3. Copy webhook → worker acquires lock → resumes Deck → copy collected → all done → releases lock
+
+If both webhooks arrive simultaneously, one worker gets the lock and processes. The second worker waits or retries with the updated snapshot — no duplicated work.
+
 ## Runnable Examples
 
 The `examples/` directory contains complete, runnable examples:
