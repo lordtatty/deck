@@ -237,8 +237,8 @@ data := loadFromRedis(jobID)
 // Import restores state and previous result
 state, prev, _ := d.Import(data)
 
-// Resume — same call as a fresh run, just with previous context
-result, err := d.Resume(ctx, state, prev)
+// Run with previous result to resume where we left off
+result, err := d.Run(ctx, state, prev)
 if result.Suspended {
     data, _ := d.Export(state, result)
     saveToRedis(jobID, data) // still not done
@@ -247,7 +247,7 @@ if result.Suspended {
 // Done! state.Result is populated.
 ```
 
-Since `Run()` is just `Resume()` with an empty result, you can unify both paths:
+`Run()` accepts an optional previous `Result`, so fresh runs and resumes use the same call:
 
 ```go
 // Worker handles both new and resume jobs with one code path
@@ -262,7 +262,7 @@ case "resume":
 }
 
 // One call — works for both fresh and resumed runs
-result, err := d.Resume(ctx, state, prev)
+result, err := d.Run(ctx, state, prev)
 ```
 
 #### Building Safe Worker Flows
@@ -295,7 +295,7 @@ func processJob(msg QueueMessage) {
     defer lock.Release()
 
     state, prev, _ := d.Import(loadFromRedis(msg.JobID))
-    result, _ := d.Resume(ctx, state, prev)
+    result, _ := d.Run(ctx, state, prev)
 
     if result.Suspended {
         data, _ := d.Export(state, result)

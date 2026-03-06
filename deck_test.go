@@ -636,7 +636,7 @@ func TestDeck_Resume_SkipsPreviouslyCompletedCues(t *testing.T) {
 	prev := deck.Result{
 		CompletedCues: []deck.CompletedCue{{Name: "CueA"}},
 	}
-	result, err := sut.Resume(ctx, state, prev)
+	result, err := sut.Run(ctx, state, prev)
 
 	// Then CueA does not re-run (count would be 101+ if it did)
 	assert.NoError(t, err)
@@ -694,7 +694,7 @@ func TestDeck_Resume_SuspendAndResumeTwoCuePattern(t *testing.T) {
 	assert.False(t, result1.Completed("SubmitBatch"))
 
 	// Resume: SubmitBatch won't fire (BatchID != ""), CheckBatch fires
-	result2, err := sut.Resume(ctx, state, result1)
+	result2, err := sut.Run(ctx, state, result1)
 	assert.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "done", state.Result)
@@ -762,7 +762,7 @@ func TestDeck_Resume_FullLifecycleWithMultipleCues(t *testing.T) {
 
 	// Resume: Setup already completed (skipped), SubmitBatch won't match (BatchID set),
 	// CollectResult fires
-	result2, err := sut.Resume(ctx, state, result1)
+	result2, err := sut.Run(ctx, state, result1)
 	assert.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "collected", state.Result)
@@ -889,7 +889,7 @@ func TestDeck_Import_RoundTrip(t *testing.T) {
 	assert.True(t, prev.Suspended)
 
 	// When we resume using the imported data
-	result2, err := d.Resume(context.Background(), importedState, prev)
+	result2, err := d.Run(context.Background(), importedState, prev)
 
 	// Then it completes successfully
 	assert.NoError(t, err)
@@ -1020,7 +1020,7 @@ func TestDeck_Import_FullLifecycle(t *testing.T) {
 	importedState, prev, err := d.Import(data)
 	assert.NoError(t, err)
 
-	result2, err := d.Resume(ctx, importedState, prev)
+	result2, err := d.Run(ctx, importedState, prev)
 	assert.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "Great article about Go [https://example.com/img.png]", importedState.Output)

@@ -136,25 +136,24 @@ func (d *Deck[S]) Import(data []byte) (*S, Result, error) {
 	return &snap.State, snap.Result, nil
 }
 
-// Run starts the Deck loop. It continues until the context is cancelled.
-func (d *Deck[S]) Run(ctx context.Context, state *S) (Result, error) {
-	return d.Resume(ctx, state, Result{})
-}
-
-// Resume continues a previously suspended Deck execution. It skips cues
-// that were already completed in the previous result and pre-populates
-// the execution history so that When predicates can inspect it.
-func (d *Deck[S]) Resume(ctx context.Context, state *S, prev Result) (Result, error) {
+// Run starts the Deck loop. It continues until no more cues trigger or the
+// context is cancelled. To resume a previously suspended execution, pass
+// the Result from Import as the optional prev argument.
+func (d *Deck[S]) Run(ctx context.Context, state *S, prev ...Result) (Result, error) {
+	var p Result
+	if len(prev) > 0 {
+		p = prev[0]
+	}
 	localState := *state
 	runner := newRunner(d, ctx, &localState)
 
 	// Pre-populate completed cues from previous result
-	if len(prev.CompletedCues) > 0 {
-		runner.completed = append(runner.completed, prev.CompletedCues...)
+	if len(p.CompletedCues) > 0 {
+		runner.completed = append(runner.completed, p.CompletedCues...)
 
 		// Remove already-completed cues from pending
-		alreadyDone := make(map[string]bool, len(prev.CompletedCues))
-		for _, c := range prev.CompletedCues {
+		alreadyDone := make(map[string]bool, len(p.CompletedCues))
+		for _, c := range p.CompletedCues {
 			alreadyDone[c.Name] = true
 		}
 		filtered := runner.pending[:0]

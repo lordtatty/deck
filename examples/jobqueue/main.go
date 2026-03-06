@@ -203,10 +203,10 @@ func workerLoop(ctx context.Context, rdb *redis.Client, d *deck.Deck[ContentStat
 			}
 		}
 
-		// One code path — Resume handles both fresh (empty prev) and continued runs
+		// One code path — Run handles both fresh (empty prev) and continued runs
 		fmt.Println()
 		fmt.Println("=== Worker: Running Deck ===")
-		result, err := d.Resume(ctx, state, prev)
+		result, err := d.Run(ctx, state, prev)
 		if err != nil {
 			log.Fatalf("Worker: deck failed for %s: %v", msg.JobID, err)
 		}
