@@ -2,6 +2,7 @@
 A streamlined Go package for orchestrating concurrent, state-driven agent execution.
 
 [![Test](https://github.com/lordtatty/deck/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/lordtatty/deck/actions/workflows/test.yml)
+[![Lint](https://github.com/lordtatty/deck/actions/workflows/lint.yml/badge.svg?branch=main)](https://github.com/lordtatty/deck/actions/workflows/lint.yml)
 
 ## Key Concepts
 
