@@ -10,6 +10,7 @@ import (
 
 	"github.com/lordtatty/deck"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestState is now unsafe (no mutex) to demonstrate race conditions
@@ -49,7 +50,7 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Act
 	// Run for a short duration to allow the loop to execute
@@ -59,7 +60,7 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 2, state.GetCount(), "Count should be incremented to 2")
 	assert.Equal(t, "HappyPath", result.CompletedCues[0].Name)
 }
@@ -99,7 +100,7 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue1, cue2)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -108,7 +109,7 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 2, state.GetCount(), "Count should be incremented to 2 via chain reaction")
 
 	assertExecutionOrder(t, result, "cue1", "cue2")
@@ -138,7 +139,7 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithCancel(context.Background())
@@ -157,7 +158,7 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 	// Assert
 	select {
 	case err := <-errChan:
-		assert.ErrorIs(t, err, context.Canceled, "Run should return context.Canceled error")
+		require.ErrorIs(t, err, context.Canceled, "Run should return context.Canceled error")
 	case <-time.After(100 * time.Millisecond):
 		assert.Fail(t, "Run did not return after cancellation")
 	}
@@ -181,7 +182,7 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -190,7 +191,7 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 1, state.GetCount(), "Cue should run exactly once")
 	assert.Equal(t, "OneShot", result.CompletedCues[0].Name)
 }
@@ -225,7 +226,7 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 	}
 
 	sut, err := deck.New(cues...)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -234,7 +235,7 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	// If race conditions occur, Buffer will be corrupted (missing chars, wrong order)
 	assert.Equal(t, string(expected), string(state.Buffer), "Buffer content should match expected sequence if updates are safe")
 	assert.Len(t, result.CompletedCues, count)
@@ -257,7 +258,7 @@ func TestDeck_New_DuplicateNames(t *testing.T) {
 	_, err := deck.New(cue1, cue2)
 
 	// Assert
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "duplicate cue name: Duplicate")
 }
 
@@ -273,7 +274,7 @@ func TestDeck_New_EmptyName(t *testing.T) {
 	_, err := deck.New(cue)
 
 	// Assert
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cue name cannot be empty")
 }
 
@@ -289,7 +290,7 @@ func TestDeck_New_NilRun(t *testing.T) {
 	_, err := deck.New(cue)
 
 	// Assert
-	assert.Error(t, err)
+	require.Error(t, err)
 	assert.Contains(t, err.Error(), "cue run cannot be nil: NilRunCue")
 }
 
@@ -316,7 +317,7 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue1, cue2)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -325,7 +326,7 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Verify names
 	var names []string
@@ -339,13 +340,13 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 		assert.False(t, c.StartTime.IsZero(), "StartTime should be set")
 		assert.False(t, c.EndTime.IsZero(), "EndTime should be set")
 		assert.True(t, c.EndTime.After(c.StartTime), "EndTime should be after StartTime")
-		assert.True(t, c.Duration() > 0, "Duration should be positive")
+		assert.Positive(t, c.Duration(), "Duration should be positive")
 
 		if c.Name == "CueA" {
-			assert.True(t, c.Duration() >= 10*time.Millisecond, "CueA duration should be at least 10ms")
+			assert.GreaterOrEqual(t, c.Duration(), 10*time.Millisecond, "CueA duration should be at least 10ms")
 		}
 		if c.Name == "CueB" {
-			assert.True(t, c.Duration() >= 20*time.Millisecond, "CueB duration should be at least 20ms")
+			assert.GreaterOrEqual(t, c.Duration(), 20*time.Millisecond, "CueB duration should be at least 20ms")
 		}
 	}
 }
@@ -374,7 +375,7 @@ func TestDeck_Run_TriggerOnHistory(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue1, cue2)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
@@ -383,7 +384,7 @@ func TestDeck_Run_TriggerOnHistory(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 2, state.Count)
 	assertExecutionOrder(t, result, "CueA", "CueB")
 }
@@ -410,7 +411,7 @@ func TestDeck_StateImmutability(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -419,7 +420,7 @@ func TestDeck_StateImmutability(t *testing.T) {
 	_, err = sut.Run(ctx, struct{}{}, state)
 
 	// Assert
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 1, state.Count, "State should only be modified by the mutation function")
 }
 
@@ -446,7 +447,7 @@ func TestDeck_Run_ExternalModification(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -473,7 +474,7 @@ func TestDeck_Run_ExternalModification(t *testing.T) {
 
 	// Wait for Run to complete
 	err = <-errChan
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Assert
 	// The cue logic (When: s.Count == 0) used the initial state.
@@ -497,7 +498,7 @@ func TestDeck_Run_NilWhen(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Act
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
@@ -506,7 +507,7 @@ func TestDeck_Run_NilWhen(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 1, state.Count, "Cue with nil When should run")
 	assert.Equal(t, "AlwaysRun", result.CompletedCues[0].Name)
 }
@@ -528,7 +529,7 @@ func TestDeck_Run_Suspend_MutationAppliedButNotCompleted(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -537,7 +538,7 @@ func TestDeck_Run_Suspend_MutationAppliedButNotCompleted(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Then the mutation is applied
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 42, state.Count, "Suspended mutation should still be applied to state")
 
 	// And the cue is NOT in CompletedCues
@@ -577,7 +578,7 @@ func TestDeck_Run_Suspend_OtherCuesDrainBeforeReturning(t *testing.T) {
 	}
 
 	sut, err := deck.New(suspendCue, normalCue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -586,7 +587,7 @@ func TestDeck_Run_Suspend_OtherCuesDrainBeforeReturning(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Then both mutations are applied
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 11, state.Count, "Both mutations should be applied")
 
 	// And the normal cue completed
@@ -628,7 +629,7 @@ func TestDeck_Resume_SkipsPreviouslyCompletedCues(t *testing.T) {
 	}
 
 	sut, err := deck.New(cueA, cueB)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -640,7 +641,7 @@ func TestDeck_Resume_SkipsPreviouslyCompletedCues(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state, prev)
 
 	// Then CueA does not re-run (count would be 101+ if it did)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 2, state.Count, "Only CueB should have run")
 
 	// And both cues appear in completed
@@ -680,23 +681,23 @@ func TestDeck_Resume_SuspendAndResumeTwoCuePattern(t *testing.T) {
 	}
 
 	sut, err := deck.New(submitCue, checkCue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx := context.Background()
 
 	// First run: SubmitBatch fires and suspends
 	state := &BatchState{}
 	result1, err := sut.Run(ctx, struct{}{}, state)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.True(t, result1.Suspended)
 	assert.Equal(t, "batch-123", state.BatchID)
-	assert.Equal(t, "", state.Result)
+	assert.Empty(t, state.Result)
 	// SubmitBatch should not be in completed (it suspended)
 	assert.False(t, result1.Completed("SubmitBatch"))
 
 	// Resume: SubmitBatch won't fire (BatchID != ""), CheckBatch fires
 	result2, err := sut.Run(ctx, struct{}{}, state, result1)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "done", state.Result)
 	assert.True(t, result2.Completed("CheckBatch"))
@@ -747,14 +748,14 @@ func TestDeck_Resume_FullLifecycleWithMultipleCues(t *testing.T) {
 	}
 
 	sut, err := deck.New(setupCue, batchCue, collectCue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx := context.Background()
 
 	// First run: Setup completes, SubmitBatch fires and suspends
 	state := &WorkState{}
 	result1, err := sut.Run(ctx, struct{}{}, state)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.True(t, result1.Suspended)
 	assert.True(t, state.SetupDone)
 	assert.Equal(t, "batch-456", state.BatchID)
@@ -764,7 +765,7 @@ func TestDeck_Resume_FullLifecycleWithMultipleCues(t *testing.T) {
 	// Resume: Setup already completed (skipped), SubmitBatch won't match (BatchID set),
 	// CollectResult fires
 	result2, err := sut.Run(ctx, struct{}{}, state, result1)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "collected", state.Result)
 	assert.True(t, result2.Completed("Setup"), "Setup should carry over from previous result")
@@ -788,7 +789,7 @@ func TestDeck_Run_Suspend_NonSuspendedMutationWorksAsNormal(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -797,7 +798,7 @@ func TestDeck_Run_Suspend_NonSuspendedMutationWorksAsNormal(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Then it completes normally with no suspension
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 5, state.Count)
 	assert.True(t, result.Completed("NormalCue"))
 	assert.False(t, result.Suspended, "Result should not be suspended for normal cues")
@@ -821,18 +822,18 @@ func TestDeck_Export_ProducesValidJSON(t *testing.T) {
 	}
 
 	d, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	state := &JobState{}
 	result, err := d.Run(context.Background(), struct{}{}, state)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.True(t, result.Suspended)
 
 	// When we export
 	data, err := d.Export(state, result)
 
 	// Then it succeeds and produces valid JSON
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotEmpty(t, data)
 
 	// And the JSON contains the state and result
@@ -870,22 +871,22 @@ func TestDeck_Import_RoundTrip(t *testing.T) {
 	}
 
 	d, err := deck.New(submitCue, collectCue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// First run: suspends after submit
 	state := &JobState{}
 	result1, err := d.Run(context.Background(), struct{}{}, state)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.True(t, result1.Suspended)
 	assert.Equal(t, "batch-abc", state.BatchID)
 
 	// Export the state
 	data, err := d.Export(state, result1)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Import restores state and previous result
 	importedState, prev, err := d.Import(data)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, "batch-abc", importedState.BatchID)
 	assert.True(t, prev.Suspended)
 
@@ -893,7 +894,7 @@ func TestDeck_Import_RoundTrip(t *testing.T) {
 	result2, err := d.Run(context.Background(), struct{}{}, importedState, prev)
 
 	// Then it completes successfully
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "batch-abc", importedState.BatchID)
 	assert.Equal(t, "collected", importedState.Result)
@@ -911,13 +912,13 @@ func TestDeck_Import_InvalidJSON(t *testing.T) {
 	}
 
 	d, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// When we try to import invalid data
 	_, _, err = d.Import([]byte("not json"))
 
 	// Then it returns an error
-	assert.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestDeck_Import_FullLifecycle(t *testing.T) {
@@ -1000,14 +1001,14 @@ func TestDeck_Import_FullLifecycle(t *testing.T) {
 	}
 
 	d, err := deck.New(setupCue, submitImage, submitCopy, collectImage, collectCopy, assembleCue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx := context.Background()
 
 	// Phase 1: Run — Setup completes, both submits suspend
 	state := &PipelineState{}
 	result1, err := d.Run(ctx, struct{}{}, state)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.True(t, result1.Suspended)
 	assert.True(t, state.Ready)
 	assert.Equal(t, "img-001", state.ImageID)
@@ -1015,14 +1016,14 @@ func TestDeck_Import_FullLifecycle(t *testing.T) {
 
 	// Export
 	data, err := d.Export(state, result1)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Phase 2: Import, then Resume — collects both results, assembles
 	importedState, prev, err := d.Import(data)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	result2, err := d.Run(ctx, struct{}{}, importedState, prev)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "Great article about Go [https://example.com/img.png]", importedState.Output)
 	assert.True(t, result2.Completed("Setup"))
@@ -1065,7 +1066,7 @@ func TestDeck_Run_Suspend_TwoConcurrentSuspends(t *testing.T) {
 	}
 
 	sut, err := deck.New(cueA, cueB)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -1075,7 +1076,7 @@ func TestDeck_Run_Suspend_TwoConcurrentSuspends(t *testing.T) {
 	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Then both mutations are applied
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, "a-001", state.BatchA, "SubmitA mutation should be applied")
 	assert.Equal(t, "b-001", state.BatchB, "SubmitB mutation should be applied")
 
@@ -1117,7 +1118,7 @@ func TestDeck_Run_Suspend_StatePreservedOnCancellation(t *testing.T) {
 	}
 
 	sut, err := deck.New(suspendCue, slowCue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -1126,7 +1127,7 @@ func TestDeck_Run_Suspend_StatePreservedOnCancellation(t *testing.T) {
 	_, runErr := sut.Run(ctx, struct{}{}, state)
 
 	// Then an error is returned (context deadline exceeded)
-	assert.Error(t, runErr)
+	require.Error(t, runErr)
 
 	// And the original state is NOT modified (error means no copy-back)
 	assert.Equal(t, 42, state.Count, "State should be unchanged when Run returns an error")
@@ -1157,7 +1158,7 @@ func TestDeck_Run_InputIsAvailableToWhenPredicate(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -1166,7 +1167,7 @@ func TestDeck_Run_InputIsAvailableToWhenPredicate(t *testing.T) {
 	result, err := sut.Run(ctx, input, state)
 
 	// Then the cue fires because the input matched
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 1, state.Count)
 	assert.True(t, result.Completed("InputAwareCue"))
 }
@@ -1189,7 +1190,7 @@ func TestDeck_Run_WhenPredicateDoesNotFireWhenInputDoesNotMatch(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -1198,7 +1199,7 @@ func TestDeck_Run_WhenPredicateDoesNotFireWhenInputDoesNotMatch(t *testing.T) {
 	result, err := sut.Run(ctx, input, state)
 
 	// Then the cue does NOT fire
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 0, state.Count, "Cue should not fire when input doesn't match")
 	assert.False(t, result.Completed("InputAwareCue"))
 }
@@ -1224,7 +1225,7 @@ func TestDeck_Run_InputIsAvailableToRunFunction(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -1233,7 +1234,7 @@ func TestDeck_Run_InputIsAvailableToRunFunction(t *testing.T) {
 	_, err = sut.Run(ctx, input, state)
 
 	// Then the run function had access to the input
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, "processed: hello world", state.Response)
 }
 
@@ -1274,7 +1275,7 @@ func TestDeck_Run_InputRemainsConsistentAcrossCueChain(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue1, cue2)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -1283,7 +1284,7 @@ func TestDeck_Run_InputRemainsConsistentAcrossCueChain(t *testing.T) {
 	_, err = sut.Run(ctx, input, state)
 
 	// Then both cues saw the same input
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 2, state.Step)
 	assert.Equal(t, "original", querySeenByCue2, "Input should remain unchanged throughout execution")
 }
@@ -1313,7 +1314,7 @@ func TestDeck_Run_InputIsPassedByValueToConcurrentCues(t *testing.T) {
 	}
 
 	sut, err := deck.New(cues...)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -1322,7 +1323,7 @@ func TestDeck_Run_InputIsPassedByValueToConcurrentCues(t *testing.T) {
 	_, err = sut.Run(ctx, input, state)
 
 	// Then all cues received the same input value
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Len(t, state.Queries, count)
 	for _, q := range state.Queries {
 		assert.Equal(t, "concurrent-test", q, "All cues should see the same input")
@@ -1348,15 +1349,15 @@ func TestDeck_Export_DoesNotIncludeInput(t *testing.T) {
 	}
 
 	d, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	state := &JobState{}
 	result, err := d.Run(context.Background(), input, state)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// When we export
 	data, err := d.Export(state, result)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Then the exported data contains state but NOT input
 	exported := string(data)
@@ -1396,19 +1397,19 @@ func TestDeck_Resume_UsesFreshInputNotOriginal(t *testing.T) {
 	}
 
 	d, err := deck.New(submitCue, collectCue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// First run with original input
 	state := &JobState{}
 	result1, err := d.Run(context.Background(), TestInput{Query: "original"}, state)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.True(t, result1.Suspended)
 
 	// When we resume with DIFFERENT input
 	result2, err := d.Run(context.Background(), TestInput{Query: "resumed"}, state, result1)
 
 	// Then the collect cue uses the fresh input, not the original
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "done with resumed", state.Output, "Resume should use the fresh input, not the original")
 }
@@ -1437,7 +1438,7 @@ func TestDeck_Run_InputIsNotMutatedByLibrary(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -1447,7 +1448,7 @@ func TestDeck_Run_InputIsNotMutatedByLibrary(t *testing.T) {
 	_, err = sut.Run(ctx, input, state)
 
 	// Then the caller's input variable is unchanged
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, inputBefore, input, "Library must not mutate caller's input variable")
 }
 
@@ -1491,7 +1492,7 @@ func TestDeck_Run_InputReferenceFieldsAreShared(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue1, cue2)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -1500,7 +1501,7 @@ func TestDeck_Run_InputReferenceFieldsAreShared(t *testing.T) {
 	_, err = sut.Run(ctx, input, state)
 
 	// Then both observe the same backing map (the reference is shared, not deep-copied)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.NotZero(t, state.Cue1Ptr, "cue1 should have captured the map pointer")
 	assert.Equal(t, state.Cue1Ptr, state.Cue2Ptr, "Reference fields in input must be shared, not deep-copied")
 }
@@ -1527,7 +1528,7 @@ func TestDeck_Run_SequentialRunsHaveIndependentInputs(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -1535,11 +1536,11 @@ func TestDeck_Run_SequentialRunsHaveIndependentInputs(t *testing.T) {
 	// When the deck runs twice with different inputs and different states
 	state1 := &GreetingState{}
 	_, err = sut.Run(ctx, GreetingInput{Name: "alice"}, state1)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	state2 := &GreetingState{}
 	_, err = sut.Run(ctx, GreetingInput{Name: "bob"}, state2)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Then each run sees only its own input — no leak from the previous run
 	assert.Equal(t, "hello, alice", state1.Greeting)
@@ -1566,7 +1567,7 @@ func TestDeck_Run_PointerInputIsSupported(t *testing.T) {
 	}
 
 	sut, err := deck.New(cue)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -1577,7 +1578,7 @@ func TestDeck_Run_PointerInputIsSupported(t *testing.T) {
 	_, err = sut.Run(ctx, input, state)
 
 	// Then the cue receives the pointer and can read fields through it
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.Equal(t, 11, state.Length)
 }
 
@@ -1599,7 +1600,7 @@ func assertExecutionOrder(t *testing.T, result deck.Result, order ...string) {
 
 		if assert.True(t, ok1, "Cue %s should have completed", currKey) &&
 			assert.True(t, ok2, "Cue %s should have completed", nextKey) {
-			assert.True(t, idx1 < idx2, "Cue %s should complete before %s", currKey, nextKey)
+			assert.Less(t, idx1, idx2, "Cue %s should complete before %s", currKey, nextKey)
 		}
 	}
 }
