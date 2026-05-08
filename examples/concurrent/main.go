@@ -12,22 +12,29 @@ import (
 
 // Three independent data fetches run concurrently.
 // A fourth cue waits for all three to complete before generating a report.
+//
+// DashboardInput holds the immutable parameters for this run — the report's
+// title. DashboardState holds the mutable counts and the generated report.
+
+type DashboardInput struct {
+	ReportTitle string
+}
 
 type DashboardState struct {
-	Users    int
-	Orders   int
-	Revenue  float64
-	Report   string
+	Users   int
+	Orders  int
+	Revenue float64
+	Report  string
 }
 
 func main() {
-	cues := []deck.Cue[DashboardState]{
+	cues := []deck.Cue[DashboardInput, DashboardState]{
 		{
 			Name: "FetchUsers",
-			When: func(s DashboardState, r deck.Result) bool {
+			When: func(i DashboardInput, s DashboardState, r deck.Result) bool {
 				return s.Users == 0
 			},
-			Run: func(s DashboardState) (deck.Mutation[DashboardState], error) {
+			Run: func(i DashboardInput, s DashboardState) (deck.Mutation[DashboardState], error) {
 				fmt.Println("[FetchUsers] Querying user count...")
 				time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
 				count := 1542
@@ -38,10 +45,10 @@ func main() {
 		},
 		{
 			Name: "FetchOrders",
-			When: func(s DashboardState, r deck.Result) bool {
+			When: func(i DashboardInput, s DashboardState, r deck.Result) bool {
 				return s.Orders == 0
 			},
-			Run: func(s DashboardState) (deck.Mutation[DashboardState], error) {
+			Run: func(i DashboardInput, s DashboardState) (deck.Mutation[DashboardState], error) {
 				fmt.Println("[FetchOrders] Querying order count...")
 				time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
 				count := 328
@@ -52,10 +59,10 @@ func main() {
 		},
 		{
 			Name: "FetchRevenue",
-			When: func(s DashboardState, r deck.Result) bool {
+			When: func(i DashboardInput, s DashboardState, r deck.Result) bool {
 				return s.Revenue == 0
 			},
-			Run: func(s DashboardState) (deck.Mutation[DashboardState], error) {
+			Run: func(i DashboardInput, s DashboardState) (deck.Mutation[DashboardState], error) {
 				fmt.Println("[FetchRevenue] Querying revenue...")
 				time.Sleep(time.Duration(50+rand.Intn(100)) * time.Millisecond)
 				rev := 48293.50
@@ -66,15 +73,16 @@ func main() {
 		},
 		{
 			Name: "GenerateReport",
-			When: func(s DashboardState, r deck.Result) bool {
+			When: func(i DashboardInput, s DashboardState, r deck.Result) bool {
 				// Only run after all three fetches complete
 				return r.Completed("FetchUsers") &&
 					r.Completed("FetchOrders") &&
 					r.Completed("FetchRevenue")
 			},
-			Run: func(s DashboardState) (deck.Mutation[DashboardState], error) {
+			Run: func(i DashboardInput, s DashboardState) (deck.Mutation[DashboardState], error) {
 				fmt.Println("[GenerateReport] Building report...")
-				report := fmt.Sprintf("%d users, %d orders, $%.2f revenue", s.Users, s.Orders, s.Revenue)
+				report := fmt.Sprintf("%s — %d users, %d orders, $%.2f revenue",
+					i.ReportTitle, s.Users, s.Orders, s.Revenue)
 				return deck.Complete(func(s *DashboardState) {
 					s.Report = report
 				}), nil
@@ -87,8 +95,9 @@ func main() {
 		log.Fatal(err)
 	}
 
+	input := DashboardInput{ReportTitle: "Q1 Daily Snapshot"}
 	state := &DashboardState{}
-	result, err := d.Run(context.Background(), state)
+	result, err := d.Run(context.Background(), input, state)
 	if err != nil {
 		log.Fatal(err)
 	}

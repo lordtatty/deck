@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -35,12 +36,12 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 	// Arrange
 	state := &TestState{Count: 1}
 
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "HappyPath",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return s.GetCount() == 1
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Complete(func(s *TestState) {
 				s.Inc()
 			}), nil
@@ -55,7 +56,7 @@ func TestDeck_Run_HappyPath(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -70,12 +71,12 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	}
 
 	// Cue 1: 0 -> 1
-	cue1 := deck.Cue[TestState]{
+	cue1 := deck.Cue[struct{}, TestState]{
 		Name: "cue1",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return s.GetCount() == 0
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			// Ensure some time passes so timestamps are distinct
 			time.Sleep(1 * time.Millisecond)
 			return deck.Complete(func(s *TestState) {
@@ -85,12 +86,12 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	}
 
 	// Cue 2: 1 -> 2
-	cue2 := deck.Cue[TestState]{
+	cue2 := deck.Cue[struct{}, TestState]{
 		Name: "cue2",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return s.GetCount() == 1
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Complete(func(s *TestState) {
 				s.Inc()
 			}), nil
@@ -104,7 +105,7 @@ func TestDeck_Run_ChainReaction(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -125,12 +126,12 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 	state := &TestState{Count: 0}
 
 	// Add a cue that sleeps for a long time
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "SleepyCue",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			time.Sleep(200 * time.Millisecond)
 			return nil, nil
 		},
@@ -145,7 +146,7 @@ func TestDeck_Run_Cancellation(t *testing.T) {
 	// Start Run in a goroutine
 	errChan := make(chan error)
 	go func() {
-		_, err := sut.Run(ctx, state)
+		_, err := sut.Run(ctx, struct{}{}, state)
 		errChan <- err
 	}()
 
@@ -167,12 +168,12 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 	state := &TestState{Count: 0}
 
 	// Add a cue that is always true
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "OneShot",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Complete(func(s *TestState) {
 				s.Inc()
 			}), nil
@@ -186,7 +187,7 @@ func TestDeck_Run_SingleExecution(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -205,14 +206,14 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 	// Construct expected buffer: "ABC...Z" repeated count times
 	expected := bytes.Repeat([]byte(alphabet), count)
 
-	cues := make([]deck.Cue[TestState], count)
+	cues := make([]deck.Cue[struct{}, TestState], count)
 	for i := range count {
-		cues[i] = deck.Cue[TestState]{
+		cues[i] = deck.Cue[struct{}, TestState]{
 			Name: fmt.Sprintf("Cue-%d", i),
-			When: func(s TestState, r deck.Result) bool {
+			When: func(_ struct{}, s TestState, r deck.Result) bool {
 				return true
 			},
-			Run: func(s TestState) (deck.Mutation[TestState], error) {
+			Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 				// Return mutation function that streams the alphabet
 				return deck.Complete(func(s *TestState) {
 					for _, r := range alphabet {
@@ -230,7 +231,7 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -241,15 +242,15 @@ func TestDeck_Run_Concurrency_Race(t *testing.T) {
 
 func TestDeck_New_DuplicateNames(t *testing.T) {
 	// Arrange
-	cue1 := deck.Cue[TestState]{
+	cue1 := deck.Cue[struct{}, TestState]{
 		Name: "Duplicate",
-		When: func(s TestState, r deck.Result) bool { return true },
-		Run:  func(s TestState) (deck.Mutation[TestState], error) { return nil, nil },
+		When: func(_ struct{}, s TestState, r deck.Result) bool { return true },
+		Run:  func(_ struct{}, s TestState) (deck.Mutation[TestState], error) { return nil, nil },
 	}
-	cue2 := deck.Cue[TestState]{
+	cue2 := deck.Cue[struct{}, TestState]{
 		Name: "Duplicate",
-		When: func(s TestState, r deck.Result) bool { return true },
-		Run:  func(s TestState) (deck.Mutation[TestState], error) { return nil, nil },
+		When: func(_ struct{}, s TestState, r deck.Result) bool { return true },
+		Run:  func(_ struct{}, s TestState) (deck.Mutation[TestState], error) { return nil, nil },
 	}
 
 	// Act
@@ -262,10 +263,10 @@ func TestDeck_New_DuplicateNames(t *testing.T) {
 
 func TestDeck_New_EmptyName(t *testing.T) {
 	// Arrange
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "",
-		When: func(s TestState, r deck.Result) bool { return true },
-		Run:  func(s TestState) (deck.Mutation[TestState], error) { return nil, nil },
+		When: func(_ struct{}, s TestState, r deck.Result) bool { return true },
+		Run:  func(_ struct{}, s TestState) (deck.Mutation[TestState], error) { return nil, nil },
 	}
 
 	// Act
@@ -278,7 +279,7 @@ func TestDeck_New_EmptyName(t *testing.T) {
 
 func TestDeck_New_NilRun(t *testing.T) {
 	// Arrange
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "NilRunCue",
 		When: nil,
 		Run:  nil,
@@ -296,19 +297,19 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 	// Arrange
 	state := &TestState{Count: 0}
 
-	cue1 := deck.Cue[TestState]{
+	cue1 := deck.Cue[struct{}, TestState]{
 		Name: "CueA",
-		When: func(s TestState, r deck.Result) bool { return s.Count == 0 },
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		When: func(_ struct{}, s TestState, r deck.Result) bool { return s.Count == 0 },
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			time.Sleep(10 * time.Millisecond) // Simulate work
 			return deck.Complete(func(s *TestState) { s.Inc() }), nil
 		},
 	}
 
-	cue2 := deck.Cue[TestState]{
+	cue2 := deck.Cue[struct{}, TestState]{
 		Name: "CueB",
-		When: func(s TestState, r deck.Result) bool { return s.Count == 1 },
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		When: func(_ struct{}, s TestState, r deck.Result) bool { return s.Count == 1 },
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			time.Sleep(20 * time.Millisecond) // Simulate work
 			return deck.Complete(func(s *TestState) { s.Inc() }), nil
 		},
@@ -321,7 +322,7 @@ func TestDeck_Run_ReturnsCompletedCues(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -353,21 +354,21 @@ func TestDeck_Run_TriggerOnHistory(t *testing.T) {
 	// Arrange
 	state := &TestState{Count: 0}
 
-	cue1 := deck.Cue[TestState]{
+	cue1 := deck.Cue[struct{}, TestState]{
 		Name: "CueA",
-		When: func(s TestState, r deck.Result) bool { return s.Count == 0 },
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		When: func(_ struct{}, s TestState, r deck.Result) bool { return s.Count == 0 },
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Complete(func(s *TestState) { s.Inc() }), nil
 		},
 	}
 
-	cue2 := deck.Cue[TestState]{
+	cue2 := deck.Cue[struct{}, TestState]{
 		Name: "CueB",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			// Trigger only if CueA has completed
 			return r.Completed("CueA")
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Complete(func(s *TestState) { s.Inc() }), nil
 		},
 	}
@@ -379,7 +380,7 @@ func TestDeck_Run_TriggerOnHistory(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -391,14 +392,14 @@ func TestDeck_StateImmutability(t *testing.T) {
 	// Arrange
 	state := &TestState{Count: 0}
 
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "BadActor",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			// Attempt to modify state in When (should be a copy)
 			s.Count = 999
 			return true
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			// Attempt to modify state in Run (should be a copy)
 			s.Count = 888
 			return deck.Complete(func(s *TestState) {
@@ -415,7 +416,7 @@ func TestDeck_StateImmutability(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	_, err = sut.Run(ctx, state)
+	_, err = sut.Run(ctx, struct{}{}, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -430,12 +431,12 @@ func TestDeck_Run_ExternalModification(t *testing.T) {
 	continueChan := make(chan struct{})
 
 	// Cue that signals start, waits, then increments
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "CoordinatedCue",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return s.Count == 0
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			close(started)
 			<-continueChan
 			return deck.Complete(func(s *TestState) {
@@ -454,7 +455,7 @@ func TestDeck_Run_ExternalModification(t *testing.T) {
 	// Start Run in background
 	errChan := make(chan error)
 	go func() {
-		_, err := sut.Run(ctx, state)
+		_, err := sut.Run(ctx, struct{}{}, state)
 		errChan <- err
 	}()
 
@@ -485,10 +486,10 @@ func TestDeck_Run_NilWhen(t *testing.T) {
 	// Arrange
 	state := &TestState{Count: 0}
 
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "AlwaysRun",
 		When: nil, // Should default to true
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Complete(func(s *TestState) {
 				s.Inc()
 			}), nil
@@ -502,7 +503,7 @@ func TestDeck_Run_NilWhen(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Assert
 	assert.NoError(t, err)
@@ -514,12 +515,12 @@ func TestDeck_Run_Suspend_MutationAppliedButNotCompleted(t *testing.T) {
 	// Given a cue that returns a Suspended mutation
 	state := &TestState{Count: 0}
 
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "SuspendingCue",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return s.Count == 0
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Suspended(func(s *TestState) {
 				s.Count = 42
 			}), nil
@@ -533,7 +534,7 @@ func TestDeck_Run_Suspend_MutationAppliedButNotCompleted(t *testing.T) {
 	defer cancel()
 
 	// When the deck runs
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Then the mutation is applied
 	assert.NoError(t, err)
@@ -550,24 +551,24 @@ func TestDeck_Run_Suspend_OtherCuesDrainBeforeReturning(t *testing.T) {
 	// Given a cue that suspends and another cue that runs normally
 	state := &TestState{Count: 0}
 
-	suspendCue := deck.Cue[TestState]{
+	suspendCue := deck.Cue[struct{}, TestState]{
 		Name: "Suspender",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Suspended(func(s *TestState) {
 				s.Count += 10
 			}), nil
 		},
 	}
 
-	normalCue := deck.Cue[TestState]{
+	normalCue := deck.Cue[struct{}, TestState]{
 		Name: "Normal",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			time.Sleep(20 * time.Millisecond) // takes a bit longer
 			return deck.Complete(func(s *TestState) {
 				s.Count += 1
@@ -582,7 +583,7 @@ func TestDeck_Run_Suspend_OtherCuesDrainBeforeReturning(t *testing.T) {
 	defer cancel()
 
 	// When the deck runs
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Then both mutations are applied
 	assert.NoError(t, err)
@@ -602,24 +603,24 @@ func TestDeck_Resume_SkipsPreviouslyCompletedCues(t *testing.T) {
 	// Given a deck where CueA has already completed
 	state := &TestState{Count: 1}
 
-	cueA := deck.Cue[TestState]{
+	cueA := deck.Cue[struct{}, TestState]{
 		Name: "CueA",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return true // would fire if not already completed
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Complete(func(s *TestState) {
 				s.Count += 100 // should NOT happen on resume
 			}), nil
 		},
 	}
 
-	cueB := deck.Cue[TestState]{
+	cueB := deck.Cue[struct{}, TestState]{
 		Name: "CueB",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return r.Completed("CueA")
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Complete(func(s *TestState) {
 				s.Count += 1
 			}), nil
@@ -636,7 +637,7 @@ func TestDeck_Resume_SkipsPreviouslyCompletedCues(t *testing.T) {
 	prev := deck.Result{
 		CompletedCues: []deck.CompletedCue{{Name: "CueA"}},
 	}
-	result, err := sut.Run(ctx, state, prev)
+	result, err := sut.Run(ctx, struct{}{}, state, prev)
 
 	// Then CueA does not re-run (count would be 101+ if it did)
 	assert.NoError(t, err)
@@ -654,24 +655,24 @@ func TestDeck_Resume_SuspendAndResumeTwoCuePattern(t *testing.T) {
 		Result  string
 	}
 
-	submitCue := deck.Cue[BatchState]{
+	submitCue := deck.Cue[struct{}, BatchState]{
 		Name: "SubmitBatch",
-		When: func(s BatchState, r deck.Result) bool {
+		When: func(_ struct{}, s BatchState, r deck.Result) bool {
 			return s.BatchID == ""
 		},
-		Run: func(s BatchState) (deck.Mutation[BatchState], error) {
+		Run: func(_ struct{}, s BatchState) (deck.Mutation[BatchState], error) {
 			return deck.Suspended(func(s *BatchState) {
 				s.BatchID = "batch-123"
 			}), nil
 		},
 	}
 
-	checkCue := deck.Cue[BatchState]{
+	checkCue := deck.Cue[struct{}, BatchState]{
 		Name: "CheckBatch",
-		When: func(s BatchState, r deck.Result) bool {
+		When: func(_ struct{}, s BatchState, r deck.Result) bool {
 			return s.BatchID != "" && s.Result == ""
 		},
-		Run: func(s BatchState) (deck.Mutation[BatchState], error) {
+		Run: func(_ struct{}, s BatchState) (deck.Mutation[BatchState], error) {
 			return deck.Complete(func(s *BatchState) {
 				s.Result = "done"
 			}), nil
@@ -685,7 +686,7 @@ func TestDeck_Resume_SuspendAndResumeTwoCuePattern(t *testing.T) {
 
 	// First run: SubmitBatch fires and suspends
 	state := &BatchState{}
-	result1, err := sut.Run(ctx, state)
+	result1, err := sut.Run(ctx, struct{}{}, state)
 	assert.NoError(t, err)
 	assert.True(t, result1.Suspended)
 	assert.Equal(t, "batch-123", state.BatchID)
@@ -694,7 +695,7 @@ func TestDeck_Resume_SuspendAndResumeTwoCuePattern(t *testing.T) {
 	assert.False(t, result1.Completed("SubmitBatch"))
 
 	// Resume: SubmitBatch won't fire (BatchID != ""), CheckBatch fires
-	result2, err := sut.Run(ctx, state, result1)
+	result2, err := sut.Run(ctx, struct{}{}, state, result1)
 	assert.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "done", state.Result)
@@ -709,36 +710,36 @@ func TestDeck_Resume_FullLifecycleWithMultipleCues(t *testing.T) {
 		Result    string
 	}
 
-	setupCue := deck.Cue[WorkState]{
+	setupCue := deck.Cue[struct{}, WorkState]{
 		Name: "Setup",
-		When: func(s WorkState, r deck.Result) bool {
+		When: func(_ struct{}, s WorkState, r deck.Result) bool {
 			return !s.SetupDone
 		},
-		Run: func(s WorkState) (deck.Mutation[WorkState], error) {
+		Run: func(_ struct{}, s WorkState) (deck.Mutation[WorkState], error) {
 			return deck.Complete(func(s *WorkState) {
 				s.SetupDone = true
 			}), nil
 		},
 	}
 
-	batchCue := deck.Cue[WorkState]{
+	batchCue := deck.Cue[struct{}, WorkState]{
 		Name: "SubmitBatch",
-		When: func(s WorkState, r deck.Result) bool {
+		When: func(_ struct{}, s WorkState, r deck.Result) bool {
 			return s.SetupDone && s.BatchID == ""
 		},
-		Run: func(s WorkState) (deck.Mutation[WorkState], error) {
+		Run: func(_ struct{}, s WorkState) (deck.Mutation[WorkState], error) {
 			return deck.Suspended(func(s *WorkState) {
 				s.BatchID = "batch-456"
 			}), nil
 		},
 	}
 
-	collectCue := deck.Cue[WorkState]{
+	collectCue := deck.Cue[struct{}, WorkState]{
 		Name: "CollectResult",
-		When: func(s WorkState, r deck.Result) bool {
+		When: func(_ struct{}, s WorkState, r deck.Result) bool {
 			return s.BatchID != "" && s.Result == ""
 		},
-		Run: func(s WorkState) (deck.Mutation[WorkState], error) {
+		Run: func(_ struct{}, s WorkState) (deck.Mutation[WorkState], error) {
 			return deck.Complete(func(s *WorkState) {
 				s.Result = "collected"
 			}), nil
@@ -752,7 +753,7 @@ func TestDeck_Resume_FullLifecycleWithMultipleCues(t *testing.T) {
 
 	// First run: Setup completes, SubmitBatch fires and suspends
 	state := &WorkState{}
-	result1, err := sut.Run(ctx, state)
+	result1, err := sut.Run(ctx, struct{}{}, state)
 	assert.NoError(t, err)
 	assert.True(t, result1.Suspended)
 	assert.True(t, state.SetupDone)
@@ -762,7 +763,7 @@ func TestDeck_Resume_FullLifecycleWithMultipleCues(t *testing.T) {
 
 	// Resume: Setup already completed (skipped), SubmitBatch won't match (BatchID set),
 	// CollectResult fires
-	result2, err := sut.Run(ctx, state, result1)
+	result2, err := sut.Run(ctx, struct{}{}, state, result1)
 	assert.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "collected", state.Result)
@@ -774,12 +775,12 @@ func TestDeck_Run_Suspend_NonSuspendedMutationWorksAsNormal(t *testing.T) {
 	// Given a cue that returns a normal (non-suspended) mutation
 	state := &TestState{Count: 0}
 
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "NormalCue",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Complete(func(s *TestState) {
 				s.Count = 5
 			}), nil
@@ -793,7 +794,7 @@ func TestDeck_Run_Suspend_NonSuspendedMutationWorksAsNormal(t *testing.T) {
 	defer cancel()
 
 	// When the deck runs
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Then it completes normally with no suspension
 	assert.NoError(t, err)
@@ -809,10 +810,10 @@ func TestDeck_Export_ProducesValidJSON(t *testing.T) {
 		Result  string `json:"result"`
 	}
 
-	cue := deck.Cue[JobState]{
+	cue := deck.Cue[struct{}, JobState]{
 		Name: "Submit",
-		When: func(s JobState, r deck.Result) bool { return s.BatchID == "" },
-		Run: func(s JobState) (deck.Mutation[JobState], error) {
+		When: func(_ struct{}, s JobState, r deck.Result) bool { return s.BatchID == "" },
+		Run: func(_ struct{}, s JobState) (deck.Mutation[JobState], error) {
 			return deck.Suspended(func(s *JobState) {
 				s.BatchID = "batch-789"
 			}), nil
@@ -823,7 +824,7 @@ func TestDeck_Export_ProducesValidJSON(t *testing.T) {
 	assert.NoError(t, err)
 
 	state := &JobState{}
-	result, err := d.Run(context.Background(), state)
+	result, err := d.Run(context.Background(), struct{}{}, state)
 	assert.NoError(t, err)
 	assert.True(t, result.Suspended)
 
@@ -846,22 +847,22 @@ func TestDeck_Import_RoundTrip(t *testing.T) {
 		Result  string `json:"result"`
 	}
 
-	submitCue := deck.Cue[JobState]{
+	submitCue := deck.Cue[struct{}, JobState]{
 		Name: "Submit",
-		When: func(s JobState, r deck.Result) bool { return s.BatchID == "" },
-		Run: func(s JobState) (deck.Mutation[JobState], error) {
+		When: func(_ struct{}, s JobState, r deck.Result) bool { return s.BatchID == "" },
+		Run: func(_ struct{}, s JobState) (deck.Mutation[JobState], error) {
 			return deck.Suspended(func(s *JobState) {
 				s.BatchID = "batch-abc"
 			}), nil
 		},
 	}
 
-	collectCue := deck.Cue[JobState]{
+	collectCue := deck.Cue[struct{}, JobState]{
 		Name: "Collect",
-		When: func(s JobState, r deck.Result) bool {
+		When: func(_ struct{}, s JobState, r deck.Result) bool {
 			return s.BatchID != "" && s.Result == ""
 		},
-		Run: func(s JobState) (deck.Mutation[JobState], error) {
+		Run: func(_ struct{}, s JobState) (deck.Mutation[JobState], error) {
 			return deck.Complete(func(s *JobState) {
 				s.Result = "collected"
 			}), nil
@@ -873,7 +874,7 @@ func TestDeck_Import_RoundTrip(t *testing.T) {
 
 	// First run: suspends after submit
 	state := &JobState{}
-	result1, err := d.Run(context.Background(), state)
+	result1, err := d.Run(context.Background(), struct{}{}, state)
 	assert.NoError(t, err)
 	assert.True(t, result1.Suspended)
 	assert.Equal(t, "batch-abc", state.BatchID)
@@ -889,7 +890,7 @@ func TestDeck_Import_RoundTrip(t *testing.T) {
 	assert.True(t, prev.Suspended)
 
 	// When we resume using the imported data
-	result2, err := d.Run(context.Background(), importedState, prev)
+	result2, err := d.Run(context.Background(), struct{}{}, importedState, prev)
 
 	// Then it completes successfully
 	assert.NoError(t, err)
@@ -901,10 +902,10 @@ func TestDeck_Import_RoundTrip(t *testing.T) {
 
 func TestDeck_Import_InvalidJSON(t *testing.T) {
 	// Given a deck
-	cue := deck.Cue[TestState]{
+	cue := deck.Cue[struct{}, TestState]{
 		Name: "Cue",
-		When: func(s TestState, r deck.Result) bool { return true },
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		When: func(_ struct{}, s TestState, r deck.Result) bool { return true },
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Complete(func(s *TestState) {}), nil
 		},
 	}
@@ -930,68 +931,68 @@ func TestDeck_Import_FullLifecycle(t *testing.T) {
 		Output   string `json:"output"`
 	}
 
-	setupCue := deck.Cue[PipelineState]{
+	setupCue := deck.Cue[struct{}, PipelineState]{
 		Name: "Setup",
-		When: func(s PipelineState, r deck.Result) bool { return !s.Ready },
-		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+		When: func(_ struct{}, s PipelineState, r deck.Result) bool { return !s.Ready },
+		Run: func(_ struct{}, s PipelineState) (deck.Mutation[PipelineState], error) {
 			return deck.Complete(func(s *PipelineState) { s.Ready = true }), nil
 		},
 	}
 
-	submitImage := deck.Cue[PipelineState]{
+	submitImage := deck.Cue[struct{}, PipelineState]{
 		Name: "SubmitImage",
-		When: func(s PipelineState, r deck.Result) bool {
+		When: func(_ struct{}, s PipelineState, r deck.Result) bool {
 			return s.Ready && s.ImageID == ""
 		},
-		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+		Run: func(_ struct{}, s PipelineState) (deck.Mutation[PipelineState], error) {
 			return deck.Suspended(func(s *PipelineState) {
 				s.ImageID = "img-001"
 			}), nil
 		},
 	}
 
-	submitCopy := deck.Cue[PipelineState]{
+	submitCopy := deck.Cue[struct{}, PipelineState]{
 		Name: "SubmitCopy",
-		When: func(s PipelineState, r deck.Result) bool {
+		When: func(_ struct{}, s PipelineState, r deck.Result) bool {
 			return s.Ready && s.CopyID == ""
 		},
-		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+		Run: func(_ struct{}, s PipelineState) (deck.Mutation[PipelineState], error) {
 			return deck.Suspended(func(s *PipelineState) {
 				s.CopyID = "copy-001"
 			}), nil
 		},
 	}
 
-	collectImage := deck.Cue[PipelineState]{
+	collectImage := deck.Cue[struct{}, PipelineState]{
 		Name: "CollectImage",
-		When: func(s PipelineState, r deck.Result) bool {
+		When: func(_ struct{}, s PipelineState, r deck.Result) bool {
 			return s.ImageID != "" && s.ImageURL == ""
 		},
-		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+		Run: func(_ struct{}, s PipelineState) (deck.Mutation[PipelineState], error) {
 			return deck.Complete(func(s *PipelineState) {
 				s.ImageURL = "https://example.com/img.png"
 			}), nil
 		},
 	}
 
-	collectCopy := deck.Cue[PipelineState]{
+	collectCopy := deck.Cue[struct{}, PipelineState]{
 		Name: "CollectCopy",
-		When: func(s PipelineState, r deck.Result) bool {
+		When: func(_ struct{}, s PipelineState, r deck.Result) bool {
 			return s.CopyID != "" && s.CopyText == ""
 		},
-		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+		Run: func(_ struct{}, s PipelineState) (deck.Mutation[PipelineState], error) {
 			return deck.Complete(func(s *PipelineState) {
 				s.CopyText = "Great article about Go"
 			}), nil
 		},
 	}
 
-	assembleCue := deck.Cue[PipelineState]{
+	assembleCue := deck.Cue[struct{}, PipelineState]{
 		Name: "Assemble",
-		When: func(s PipelineState, r deck.Result) bool {
+		When: func(_ struct{}, s PipelineState, r deck.Result) bool {
 			return s.ImageURL != "" && s.CopyText != "" && s.Output == ""
 		},
-		Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+		Run: func(_ struct{}, s PipelineState) (deck.Mutation[PipelineState], error) {
 			return deck.Complete(func(s *PipelineState) {
 				s.Output = s.CopyText + " [" + s.ImageURL + "]"
 			}), nil
@@ -1005,7 +1006,7 @@ func TestDeck_Import_FullLifecycle(t *testing.T) {
 
 	// Phase 1: Run — Setup completes, both submits suspend
 	state := &PipelineState{}
-	result1, err := d.Run(ctx, state)
+	result1, err := d.Run(ctx, struct{}{}, state)
 	assert.NoError(t, err)
 	assert.True(t, result1.Suspended)
 	assert.True(t, state.Ready)
@@ -1020,7 +1021,7 @@ func TestDeck_Import_FullLifecycle(t *testing.T) {
 	importedState, prev, err := d.Import(data)
 	assert.NoError(t, err)
 
-	result2, err := d.Run(ctx, importedState, prev)
+	result2, err := d.Run(ctx, struct{}{}, importedState, prev)
 	assert.NoError(t, err)
 	assert.False(t, result2.Suspended)
 	assert.Equal(t, "Great article about Go [https://example.com/img.png]", importedState.Output)
@@ -1037,12 +1038,12 @@ func TestDeck_Run_Suspend_TwoConcurrentSuspends(t *testing.T) {
 		BatchB string
 	}
 
-	cueA := deck.Cue[DualState]{
+	cueA := deck.Cue[struct{}, DualState]{
 		Name: "SubmitA",
-		When: func(s DualState, r deck.Result) bool {
+		When: func(_ struct{}, s DualState, r deck.Result) bool {
 			return s.BatchA == ""
 		},
-		Run: func(s DualState) (deck.Mutation[DualState], error) {
+		Run: func(_ struct{}, s DualState) (deck.Mutation[DualState], error) {
 			time.Sleep(10 * time.Millisecond) // simulate work
 			return deck.Suspended(func(s *DualState) {
 				s.BatchA = "a-001"
@@ -1050,12 +1051,12 @@ func TestDeck_Run_Suspend_TwoConcurrentSuspends(t *testing.T) {
 		},
 	}
 
-	cueB := deck.Cue[DualState]{
+	cueB := deck.Cue[struct{}, DualState]{
 		Name: "SubmitB",
-		When: func(s DualState, r deck.Result) bool {
+		When: func(_ struct{}, s DualState, r deck.Result) bool {
 			return s.BatchB == ""
 		},
-		Run: func(s DualState) (deck.Mutation[DualState], error) {
+		Run: func(_ struct{}, s DualState) (deck.Mutation[DualState], error) {
 			time.Sleep(10 * time.Millisecond) // simulate work
 			return deck.Suspended(func(s *DualState) {
 				s.BatchB = "b-001"
@@ -1071,7 +1072,7 @@ func TestDeck_Run_Suspend_TwoConcurrentSuspends(t *testing.T) {
 
 	// When both cues fire concurrently and both suspend
 	state := &DualState{}
-	result, err := sut.Run(ctx, state)
+	result, err := sut.Run(ctx, struct{}{}, state)
 
 	// Then both mutations are applied
 	assert.NoError(t, err)
@@ -1090,24 +1091,24 @@ func TestDeck_Run_Suspend_StatePreservedOnCancellation(t *testing.T) {
 	// Given a cue that suspends, and the context is cancelled during drain
 	state := &TestState{Count: 42}
 
-	suspendCue := deck.Cue[TestState]{
+	suspendCue := deck.Cue[struct{}, TestState]{
 		Name: "Suspender",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			return deck.Suspended(func(s *TestState) {
 				s.Count = 99
 			}), nil
 		},
 	}
 
-	slowCue := deck.Cue[TestState]{
+	slowCue := deck.Cue[struct{}, TestState]{
 		Name: "SlowCue",
-		When: func(s TestState, r deck.Result) bool {
+		When: func(_ struct{}, s TestState, r deck.Result) bool {
 			return true
 		},
-		Run: func(s TestState) (deck.Mutation[TestState], error) {
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
 			time.Sleep(500 * time.Millisecond) // will exceed context
 			return deck.Complete(func(s *TestState) {
 				s.Count = 999
@@ -1122,13 +1123,462 @@ func TestDeck_Run_Suspend_StatePreservedOnCancellation(t *testing.T) {
 	defer cancel()
 
 	// When the deck runs and context expires during drain
-	_, runErr := sut.Run(ctx, state)
+	_, runErr := sut.Run(ctx, struct{}{}, state)
 
 	// Then an error is returned (context deadline exceeded)
 	assert.Error(t, runErr)
 
 	// And the original state is NOT modified (error means no copy-back)
 	assert.Equal(t, 42, state.Count, "State should be unchanged when Run returns an error")
+}
+
+// --- Input parameter behavior tests ---
+
+type TestInput struct {
+	Query  string
+	APIKey string
+}
+
+func TestDeck_Run_InputIsAvailableToWhenPredicate(t *testing.T) {
+	// Given a cue whose When predicate checks the input
+	state := &TestState{Count: 0}
+	input := TestInput{Query: "find me results"}
+
+	cue := deck.Cue[TestInput, TestState]{
+		Name: "InputAwareCue",
+		When: func(i TestInput, s TestState, r deck.Result) bool {
+			return i.Query == "find me results"
+		},
+		Run: func(i TestInput, s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) {
+				s.Inc()
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs with the input
+	result, err := sut.Run(ctx, input, state)
+
+	// Then the cue fires because the input matched
+	assert.NoError(t, err)
+	assert.Equal(t, 1, state.Count)
+	assert.True(t, result.Completed("InputAwareCue"))
+}
+
+func TestDeck_Run_WhenPredicateDoesNotFireWhenInputDoesNotMatch(t *testing.T) {
+	// Given a cue whose When predicate checks the input for a specific value
+	state := &TestState{Count: 0}
+	input := TestInput{Query: "wrong query"}
+
+	cue := deck.Cue[TestInput, TestState]{
+		Name: "InputAwareCue",
+		When: func(i TestInput, s TestState, r deck.Result) bool {
+			return i.Query == "find me results"
+		},
+		Run: func(i TestInput, s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) {
+				s.Inc()
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs with a non-matching input
+	result, err := sut.Run(ctx, input, state)
+
+	// Then the cue does NOT fire
+	assert.NoError(t, err)
+	assert.Equal(t, 0, state.Count, "Cue should not fire when input doesn't match")
+	assert.False(t, result.Completed("InputAwareCue"))
+}
+
+func TestDeck_Run_InputIsAvailableToRunFunction(t *testing.T) {
+	// Given a cue whose Run function uses the input to produce output
+	type OutputState struct {
+		Response string
+	}
+
+	input := TestInput{Query: "hello world"}
+	state := &OutputState{}
+
+	cue := deck.Cue[TestInput, OutputState]{
+		Name: "UseInput",
+		Run: func(i TestInput, s OutputState) (deck.Mutation[OutputState], error) {
+			// Capture input value for use in mutation
+			query := i.Query
+			return deck.Complete(func(s *OutputState) {
+				s.Response = "processed: " + query
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs
+	_, err = sut.Run(ctx, input, state)
+
+	// Then the run function had access to the input
+	assert.NoError(t, err)
+	assert.Equal(t, "processed: hello world", state.Response)
+}
+
+func TestDeck_Run_InputRemainsConsistentAcrossCueChain(t *testing.T) {
+	// Given two cues in a chain, both should see the same input value
+	type Counter struct {
+		Step int
+	}
+
+	input := TestInput{Query: "original"}
+	state := &Counter{Step: 0}
+
+	var querySeenByCue2 string
+
+	cue1 := deck.Cue[TestInput, Counter]{
+		Name: "Step1",
+		When: func(i TestInput, s Counter, r deck.Result) bool {
+			return s.Step == 0
+		},
+		Run: func(i TestInput, s Counter) (deck.Mutation[Counter], error) {
+			return deck.Complete(func(s *Counter) {
+				s.Step = 1
+			}), nil
+		},
+	}
+
+	cue2 := deck.Cue[TestInput, Counter]{
+		Name: "Step2",
+		When: func(i TestInput, s Counter, r deck.Result) bool {
+			return s.Step == 1
+		},
+		Run: func(i TestInput, s Counter) (deck.Mutation[Counter], error) {
+			querySeenByCue2 = i.Query
+			return deck.Complete(func(s *Counter) {
+				s.Step = 2
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue1, cue2)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// When cues run in sequence
+	_, err = sut.Run(ctx, input, state)
+
+	// Then both cues saw the same input
+	assert.NoError(t, err)
+	assert.Equal(t, 2, state.Step)
+	assert.Equal(t, "original", querySeenByCue2, "Input should remain unchanged throughout execution")
+}
+
+func TestDeck_Run_InputIsPassedByValueToConcurrentCues(t *testing.T) {
+	// Given multiple cues that run concurrently and all read the same input
+	type Results struct {
+		Queries []string
+	}
+
+	input := TestInput{Query: "concurrent-test"}
+	state := &Results{}
+
+	count := 10
+	cues := make([]deck.Cue[TestInput, Results], count)
+	for i := range count {
+		cues[i] = deck.Cue[TestInput, Results]{
+			Name: fmt.Sprintf("Cue-%d", i),
+			Run: func(inp TestInput, s Results) (deck.Mutation[Results], error) {
+				q := inp.Query
+				time.Sleep(5 * time.Millisecond)
+				return deck.Complete(func(s *Results) {
+					s.Queries = append(s.Queries, q)
+				}), nil
+			},
+		}
+	}
+
+	sut, err := deck.New(cues...)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	// When all cues run concurrently
+	_, err = sut.Run(ctx, input, state)
+
+	// Then all cues received the same input value
+	assert.NoError(t, err)
+	assert.Len(t, state.Queries, count)
+	for _, q := range state.Queries {
+		assert.Equal(t, "concurrent-test", q, "All cues should see the same input")
+	}
+}
+
+func TestDeck_Export_DoesNotIncludeInput(t *testing.T) {
+	// Given a deck that suspends with input and state
+	type JobState struct {
+		BatchID string `json:"batch_id"`
+	}
+
+	input := TestInput{Query: "secret-query", APIKey: "secret-key"}
+
+	cue := deck.Cue[TestInput, JobState]{
+		Name: "Submit",
+		When: func(i TestInput, s JobState, r deck.Result) bool { return s.BatchID == "" },
+		Run: func(i TestInput, s JobState) (deck.Mutation[JobState], error) {
+			return deck.Suspended(func(s *JobState) {
+				s.BatchID = "batch-001"
+			}), nil
+		},
+	}
+
+	d, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	state := &JobState{}
+	result, err := d.Run(context.Background(), input, state)
+	assert.NoError(t, err)
+
+	// When we export
+	data, err := d.Export(state, result)
+	assert.NoError(t, err)
+
+	// Then the exported data contains state but NOT input
+	exported := string(data)
+	assert.Contains(t, exported, "batch-001")
+	assert.NotContains(t, exported, "secret-query", "Input should not be exported")
+	assert.NotContains(t, exported, "secret-key", "Input should not be exported")
+}
+
+func TestDeck_Resume_UsesFreshInputNotOriginal(t *testing.T) {
+	// Given a deck that suspended and is resumed with different input
+	type JobState struct {
+		BatchID string
+		Output  string
+	}
+
+	submitCue := deck.Cue[TestInput, JobState]{
+		Name: "Submit",
+		When: func(i TestInput, s JobState, r deck.Result) bool { return s.BatchID == "" },
+		Run: func(i TestInput, s JobState) (deck.Mutation[JobState], error) {
+			return deck.Suspended(func(s *JobState) {
+				s.BatchID = "batch-xyz"
+			}), nil
+		},
+	}
+
+	collectCue := deck.Cue[TestInput, JobState]{
+		Name: "Collect",
+		When: func(i TestInput, s JobState, r deck.Result) bool {
+			return s.BatchID != "" && s.Output == ""
+		},
+		Run: func(i TestInput, s JobState) (deck.Mutation[JobState], error) {
+			query := i.Query
+			return deck.Complete(func(s *JobState) {
+				s.Output = "done with " + query
+			}), nil
+		},
+	}
+
+	d, err := deck.New(submitCue, collectCue)
+	assert.NoError(t, err)
+
+	// First run with original input
+	state := &JobState{}
+	result1, err := d.Run(context.Background(), TestInput{Query: "original"}, state)
+	assert.NoError(t, err)
+	assert.True(t, result1.Suspended)
+
+	// When we resume with DIFFERENT input
+	result2, err := d.Run(context.Background(), TestInput{Query: "resumed"}, state, result1)
+
+	// Then the collect cue uses the fresh input, not the original
+	assert.NoError(t, err)
+	assert.False(t, result2.Suspended)
+	assert.Equal(t, "done with resumed", state.Output, "Resume should use the fresh input, not the original")
+}
+
+func TestDeck_Run_InputIsNotMutatedByLibrary(t *testing.T) {
+	// Given an input with several fields and a cue that reads them
+	type RichInput struct {
+		Query  string
+		APIKey string
+		Limit  int
+	}
+	type State struct {
+		Hits int
+	}
+
+	input := RichInput{Query: "search", APIKey: "secret", Limit: 10}
+	inputBefore := input
+
+	cue := deck.Cue[RichInput, State]{
+		Name: "ReadInput",
+		Run: func(i RichInput, s State) (deck.Mutation[State], error) {
+			return deck.Complete(func(s *State) {
+				s.Hits = i.Limit
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs to completion
+	state := &State{}
+	_, err = sut.Run(ctx, input, state)
+
+	// Then the caller's input variable is unchanged
+	assert.NoError(t, err)
+	assert.Equal(t, inputBefore, input, "Library must not mutate caller's input variable")
+}
+
+func TestDeck_Run_InputReferenceFieldsAreShared(t *testing.T) {
+	// Given an input containing a map field
+	type ContextInput struct {
+		Headers map[string]string
+	}
+	type CapturedPointers struct {
+		Cue1Ptr uintptr
+		Cue2Ptr uintptr
+	}
+
+	input := ContextInput{Headers: map[string]string{"trace-id": "abc-123"}}
+	state := &CapturedPointers{}
+
+	cue1 := deck.Cue[ContextInput, CapturedPointers]{
+		Name: "CaptureMapPointer1",
+		When: func(i ContextInput, s CapturedPointers, r deck.Result) bool {
+			return s.Cue1Ptr == 0
+		},
+		Run: func(i ContextInput, s CapturedPointers) (deck.Mutation[CapturedPointers], error) {
+			ptr := reflect.ValueOf(i.Headers).Pointer()
+			return deck.Complete(func(s *CapturedPointers) {
+				s.Cue1Ptr = ptr
+			}), nil
+		},
+	}
+
+	cue2 := deck.Cue[ContextInput, CapturedPointers]{
+		Name: "CaptureMapPointer2",
+		When: func(i ContextInput, s CapturedPointers, r deck.Result) bool {
+			return s.Cue1Ptr != 0 && s.Cue2Ptr == 0
+		},
+		Run: func(i ContextInput, s CapturedPointers) (deck.Mutation[CapturedPointers], error) {
+			ptr := reflect.ValueOf(i.Headers).Pointer()
+			return deck.Complete(func(s *CapturedPointers) {
+				s.Cue2Ptr = ptr
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue1, cue2)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// When two cues capture the map's underlying pointer
+	_, err = sut.Run(ctx, input, state)
+
+	// Then both observe the same backing map (the reference is shared, not deep-copied)
+	assert.NoError(t, err)
+	assert.NotZero(t, state.Cue1Ptr, "cue1 should have captured the map pointer")
+	assert.Equal(t, state.Cue1Ptr, state.Cue2Ptr, "Reference fields in input must be shared, not deep-copied")
+}
+
+func TestDeck_Run_SequentialRunsHaveIndependentInputs(t *testing.T) {
+	// Given a single Deck used for two consecutive runs with different inputs
+	type GreetingInput struct {
+		Name string
+	}
+	type GreetingState struct {
+		Greeting string
+	}
+
+	cue := deck.Cue[GreetingInput, GreetingState]{
+		Name: "Greet",
+		When: func(i GreetingInput, s GreetingState, r deck.Result) bool {
+			return s.Greeting == ""
+		},
+		Run: func(i GreetingInput, s GreetingState) (deck.Mutation[GreetingState], error) {
+			return deck.Complete(func(s *GreetingState) {
+				s.Greeting = "hello, " + i.Name
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs twice with different inputs and different states
+	state1 := &GreetingState{}
+	_, err = sut.Run(ctx, GreetingInput{Name: "alice"}, state1)
+	assert.NoError(t, err)
+
+	state2 := &GreetingState{}
+	_, err = sut.Run(ctx, GreetingInput{Name: "bob"}, state2)
+	assert.NoError(t, err)
+
+	// Then each run sees only its own input — no leak from the previous run
+	assert.Equal(t, "hello, alice", state1.Greeting)
+	assert.Equal(t, "hello, bob", state2.Greeting)
+}
+
+func TestDeck_Run_PointerInputIsSupported(t *testing.T) {
+	// Given a Cue parameterised with a pointer type as input
+	type LargeInput struct {
+		Body string
+	}
+	type State struct {
+		Length int
+	}
+
+	cue := deck.Cue[*LargeInput, State]{
+		Name: "MeasureBody",
+		Run: func(i *LargeInput, s State) (deck.Mutation[State], error) {
+			length := len(i.Body)
+			return deck.Complete(func(s *State) {
+				s.Length = length
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs with a pointer input
+	input := &LargeInput{Body: "hello world"}
+	state := &State{}
+	_, err = sut.Run(ctx, input, state)
+
+	// Then the cue receives the pointer and can read fields through it
+	assert.NoError(t, err)
+	assert.Equal(t, 11, state.Length)
 }
 
 func assertExecutionOrder(t *testing.T, result deck.Result, order ...string) {
