@@ -1,2 +1,8 @@
 CLAUDE.md
 state.json
+/docs
+
+# Compiled example binaries (each example produces a binary named after its directory)
+/examples/basic/basic
+/examples/concurrent/concurrent
+/examples/jobqueue/jobqueue

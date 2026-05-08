@@ -10,6 +10,13 @@ import (
 
 // A simple pipeline: Prepare data, then Process it, then Summarise.
 // Each cue triggers the next via state changes.
+//
+// PipelineInput holds the immutable parameters for this run — the source we're
+// fetching from. PipelineState holds the mutable progress as the pipeline runs.
+
+type PipelineInput struct {
+	Source string
+}
 
 type PipelineState struct {
 	Items     []string
@@ -18,14 +25,14 @@ type PipelineState struct {
 }
 
 func main() {
-	cues := []deck.Cue[PipelineState]{
+	cues := []deck.Cue[PipelineInput, PipelineState]{
 		{
 			Name: "Prepare",
-			When: func(s PipelineState, r deck.Result) bool {
+			When: func(i PipelineInput, s PipelineState, r deck.Result) bool {
 				return len(s.Items) == 0
 			},
-			Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
-				fmt.Println("[Prepare] Fetching items...")
+			Run: func(i PipelineInput, s PipelineState) (deck.Mutation[PipelineState], error) {
+				fmt.Printf("[Prepare] Fetching items from %s...\n", i.Source)
 				return deck.Complete(func(s *PipelineState) {
 					s.Items = []string{"alpha", "bravo", "charlie"}
 				}), nil
@@ -33,10 +40,10 @@ func main() {
 		},
 		{
 			Name: "Process",
-			When: func(s PipelineState, r deck.Result) bool {
+			When: func(i PipelineInput, s PipelineState, r deck.Result) bool {
 				return len(s.Items) > 0 && len(s.Processed) == 0
 			},
-			Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+			Run: func(i PipelineInput, s PipelineState) (deck.Mutation[PipelineState], error) {
 				fmt.Println("[Process] Processing items...")
 				var results []string
 				for _, item := range s.Items {
@@ -49,13 +56,13 @@ func main() {
 		},
 		{
 			Name: "Summarise",
-			When: func(s PipelineState, r deck.Result) bool {
+			When: func(i PipelineInput, s PipelineState, r deck.Result) bool {
 				return len(s.Processed) > 0 && s.Summary == ""
 			},
-			Run: func(s PipelineState) (deck.Mutation[PipelineState], error) {
+			Run: func(i PipelineInput, s PipelineState) (deck.Mutation[PipelineState], error) {
 				fmt.Println("[Summarise] Creating summary...")
 				return deck.Complete(func(s *PipelineState) {
-					s.Summary = fmt.Sprintf("Processed %d items", len(s.Processed))
+					s.Summary = fmt.Sprintf("Processed %d items from %s", len(s.Processed), i.Source)
 				}), nil
 			},
 		},
@@ -66,14 +73,16 @@ func main() {
 		log.Fatal(err)
 	}
 
+	input := PipelineInput{Source: "warehouse-A"}
 	state := &PipelineState{}
-	result, err := d.Run(context.Background(), state)
+	result, err := d.Run(context.Background(), input, state)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	fmt.Println()
 	fmt.Println("=== Result ===")
+	fmt.Printf("Source:    %s\n", input.Source)
 	fmt.Printf("Items:     %v\n", state.Items)
 	fmt.Printf("Processed: %v\n", state.Processed)
 	fmt.Printf("Summary:   %s\n", state.Summary)

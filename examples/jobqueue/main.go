@@ -22,35 +22,38 @@ import (
 //
 // The flow:
 //
-//  1. Producer enqueues a new job onto the work queue
-//  2. Worker picks it up, runs the Deck — two API calls suspend
-//  3. Worker exports state to Redis, exits (frees the worker)
+//  1. Producer stores the job's immutable input (jobs:<id>:input) and
+//     enqueues a "new" message
+//  2. Worker picks it up, loads input, runs the Deck — two API calls suspend
+//  3. Worker exports STATE (not input) to Redis (jobs:<id>:snapshot), exits
 //  4. External APIs complete and hit a webhook endpoint
 //  5. Webhook handler stores the result, re-enqueues a resume job
-//  6. A new worker picks up the resume job, loads snapshot, resumes Deck
-//  7. If still waiting on other APIs → export, exit again
-//  8. When all results are in → final cue publishes content
+//  6. A new worker picks up the resume job, loads input AND snapshot, resumes
+//  7. If still waiting on other APIs → export state, exit again
+//  8. When all results are in → final cue publishes content; both keys cleaned up
 //
-// Infrastructure: Redis via testcontainers (LIST for queue, STRING for
-// snapshots and results).
+// Note the I/S split: JobInput is immutable per-job parameters that live in a
+// separate Redis key. ContentState is mutable progress that's persisted via
+// Export/Import. Snapshots never contain input — that's the contract.
 
-// QueueMessage is what goes on the work queue. It can be either a new job
-// or a resume trigger — the worker handles both.
+// QueueMessage is what goes on the work queue. It carries only the job ID;
+// the input itself lives in Redis at inputKey(jobID).
 type QueueMessage struct {
 	Type  string `json:"type"` // "new" or "resume"
 	JobID string `json:"job_id"`
-
-	// Only set for "new" jobs
-	Topic string `json:"topic,omitempty"`
-	Style string `json:"style,omitempty"`
 }
 
-// ContentState is the Deck state that tracks the full pipeline.
-type ContentState struct {
+// JobInput is the immutable input for a job: who/what we're generating for.
+// Stored once at job creation, read by every cue, never persisted via Export.
+type JobInput struct {
 	JobID string `json:"job_id"`
 	Topic string `json:"topic"`
 	Style string `json:"style"`
+}
 
+// ContentState is the mutable progress as the pipeline runs. Persisted via
+// Export when the Deck suspends.
+type ContentState struct {
 	Validated bool `json:"validated"`
 
 	ImageRequestID string `json:"image_request_id,omitempty"`
@@ -67,6 +70,7 @@ const (
 	webhookChannel = "jobs:webhooks"
 )
 
+func inputKey(jobID string) string    { return fmt.Sprintf("jobs:%s:input", jobID) }
 func snapshotKey(jobID string) string { return fmt.Sprintf("jobs:%s:snapshot", jobID) }
 func resultKey(requestID string) string {
 	return fmt.Sprintf("results:%s", requestID)
@@ -114,15 +118,16 @@ func main() {
 	// Give workers time to start listening
 	time.Sleep(200 * time.Millisecond)
 
-	// --- Producer: enqueue a new job ---
+	// --- Producer: store input + enqueue a new job ---
 	fmt.Println("=== Producer: Enqueuing Job ===")
 	jobID := uuid.New().String()[:8]
-	enqueue(ctx, rdb, QueueMessage{
-		Type:  "new",
+	input := JobInput{
 		JobID: jobID,
 		Topic: "Why Go is great for building concurrent systems",
 		Style: "professional blog post",
-	})
+	}
+	storeInput(ctx, rdb, input)
+	enqueue(ctx, rdb, QueueMessage{Type: "new", JobID: jobID})
 	fmt.Println()
 
 	// --- Simulate external API completions ---
@@ -130,7 +135,10 @@ func main() {
 	// Image generation completes after 1.5s
 	go func() {
 		time.Sleep(1500 * time.Millisecond)
-		reqID := waitForField(ctx, rdb, d, jobID, "image_request_id")
+		reqID := waitForStateField(ctx, rdb, d, jobID, "image_request_id")
+		if reqID == "" {
+			return // ctx cancelled
+		}
 		fmt.Printf("  [ImageGen API] Request %s complete, posting webhook\n", reqID)
 		rdb.Set(ctx, resultKey(reqID), "https://cdn.localhost/images/go-concurrency-hero.png", 0)
 		rdb.Publish(ctx, webhookChannel, fmt.Sprintf(`{"job_id":"%s","type":"image_complete"}`, jobID))
@@ -139,7 +147,10 @@ func main() {
 	// Copywriting completes after 3s
 	go func() {
 		time.Sleep(3000 * time.Millisecond)
-		reqID := waitForField(ctx, rdb, d, jobID, "copy_request_id")
+		reqID := waitForStateField(ctx, rdb, d, jobID, "copy_request_id")
+		if reqID == "" {
+			return // ctx cancelled
+		}
 		fmt.Printf("  [CopyGen API] Request %s complete, posting webhook\n", reqID)
 		copyText := `Go's goroutines and channels make concurrent programming intuitive and safe. ` +
 			`Unlike thread-based models, Go's lightweight goroutines let you spin up thousands of ` +
@@ -156,17 +167,48 @@ func main() {
 	}
 }
 
+// storeInput persists the immutable input for a job. Producers call this once
+// at job creation; workers read it on every run (new or resume).
+func storeInput(ctx context.Context, rdb *redis.Client, input JobInput) {
+	data, err := json.Marshal(input)
+	if err != nil {
+		log.Fatalf("Producer: failed to marshal input: %v", err)
+	}
+	if err := rdb.Set(ctx, inputKey(input.JobID), data, 0).Err(); err != nil {
+		log.Fatalf("Producer: failed to store input: %v", err)
+	}
+	fmt.Printf("  Input stored at %s (topic=%q, style=%q)\n", inputKey(input.JobID), input.Topic, input.Style)
+}
+
+// loadInput fetches a job's immutable input from Redis.
+func loadInput(ctx context.Context, rdb *redis.Client, jobID string) (JobInput, error) {
+	data, err := rdb.Get(ctx, inputKey(jobID)).Bytes()
+	if err != nil {
+		return JobInput{}, fmt.Errorf("load input for %s: %w", jobID, err)
+	}
+	var input JobInput
+	if err := json.Unmarshal(data, &input); err != nil {
+		return JobInput{}, fmt.Errorf("unmarshal input for %s: %w", jobID, err)
+	}
+	return input, nil
+}
+
 // enqueue pushes a message onto the work queue.
 func enqueue(ctx context.Context, rdb *redis.Client, msg QueueMessage) {
-	data, _ := json.Marshal(msg)
-	rdb.LPush(ctx, queueKey, data)
+	data, err := json.Marshal(msg)
+	if err != nil {
+		log.Fatalf("enqueue: marshal failed: %v", err)
+	}
+	if err := rdb.LPush(ctx, queueKey, data).Err(); err != nil {
+		log.Fatalf("enqueue: LPush failed: %v", err)
+	}
 	fmt.Printf("  Enqueued: type=%s job=%s\n", msg.Type, msg.JobID)
 }
 
 // workerLoop continuously pops jobs from the queue and processes them.
 // Each iteration is a stateless unit of work — the worker has no memory
 // between jobs.
-func workerLoop(ctx context.Context, rdb *redis.Client, d *deck.Deck[ContentState], completed chan<- struct{}) {
+func workerLoop(ctx context.Context, rdb *redis.Client, d *deck.Deck[JobInput, ContentState], completed chan<- struct{}) {
 	for {
 		fmt.Println("  [Worker] Waiting for next job...")
 		popped, err := rdb.BRPop(ctx, 30*time.Second, queueKey).Result()
@@ -181,17 +223,21 @@ func workerLoop(ctx context.Context, rdb *redis.Client, d *deck.Deck[ContentStat
 
 		fmt.Printf("\n  [Worker] Picked up %s job for %s\n", msg.Type, msg.JobID)
 
-		// Build state and previous result — same shape regardless of new vs resume
+		// Always load the immutable input for this job — it lives in Redis,
+		// not in the snapshot, and the worker provides it fresh on every run.
+		input, err := loadInput(ctx, rdb, msg.JobID)
+		if err != nil {
+			log.Fatalf("Worker: %v", err)
+		}
+
+		// Build state and previous result depending on whether this is a fresh
+		// run or a resume.
 		var state *ContentState
 		var prev deck.Result
 
 		switch msg.Type {
 		case "new":
-			state = &ContentState{
-				JobID: msg.JobID,
-				Topic: msg.Topic,
-				Style: msg.Style,
-			}
+			state = &ContentState{}
 		case "resume":
 			exportData, loadErr := rdb.Get(ctx, snapshotKey(msg.JobID)).Bytes()
 			if loadErr != nil {
@@ -201,32 +247,41 @@ func workerLoop(ctx context.Context, rdb *redis.Client, d *deck.Deck[ContentStat
 			if err != nil {
 				log.Fatalf("Worker: failed to import snapshot for %s: %v", msg.JobID, err)
 			}
+		default:
+			log.Fatalf("Worker: unknown message type %q for job %s", msg.Type, msg.JobID)
 		}
 
-		// One code path — Run handles both fresh (empty prev) and continued runs
+		// One code path — Run handles both fresh (empty prev) and continued runs.
+		// Input is passed every time; state + prev only matter on resume.
 		fmt.Println()
 		fmt.Println("=== Worker: Running Deck ===")
-		result, err := d.Run(ctx, state, prev)
+		result, err := d.Run(ctx, input, state, prev)
 		if err != nil {
 			log.Fatalf("Worker: deck failed for %s: %v", msg.JobID, err)
 		}
 
 		if result.Suspended {
-			// Export state and exit — worker is done, webhook will re-enqueue
+			// Export state and exit — worker is done, webhook will re-enqueue.
+			// Note: input is NOT in this snapshot. It's already in Redis at
+			// inputKey() and the next worker will load it fresh.
 			fmt.Println()
 			fmt.Println("  [Worker] Deck suspended — exporting state and exiting")
 			data, exportErr := d.Export(state, result)
 			if exportErr != nil {
 				log.Fatalf("Worker: export failed: %v", exportErr)
 			}
-			rdb.Set(ctx, snapshotKey(state.JobID), data, 0)
+			if err := rdb.Set(ctx, snapshotKey(msg.JobID), data, 0).Err(); err != nil {
+				log.Fatalf("Worker: failed to save snapshot for %s: %v", msg.JobID, err)
+			}
 			fmt.Println("  [Worker] State saved. Worker exiting, waiting for webhook.")
 			continue
 		}
 
-		// Complete — clean up and signal done
-		rdb.Del(ctx, snapshotKey(state.JobID))
-		printComplete(state, result)
+		// Complete — clean up both keys (input + snapshot) and signal done.
+		if err := rdb.Del(ctx, snapshotKey(msg.JobID), inputKey(msg.JobID)).Err(); err != nil {
+			log.Fatalf("Worker: failed to clean up keys for %s: %v", msg.JobID, err)
+		}
+		printComplete(input, state, result)
 		close(completed)
 		return
 	}
@@ -261,19 +316,19 @@ func webhookHandler(ctx context.Context, rdb *redis.Client) {
 }
 
 // buildDeck creates the content generation pipeline.
-func buildDeck(rdb *redis.Client) *deck.Deck[ContentState] {
-	cues := []deck.Cue[ContentState]{
+func buildDeck(rdb *redis.Client) *deck.Deck[JobInput, ContentState] {
+	cues := []deck.Cue[JobInput, ContentState]{
 		{
 			Name: "ValidateRequest",
-			When: func(s ContentState, r deck.Result) bool {
+			When: func(i JobInput, s ContentState, r deck.Result) bool {
 				return !s.Validated
 			},
-			Run: func(s ContentState) (deck.Mutation[ContentState], error) {
-				fmt.Printf("  [ValidateRequest] Validating job %s...\n", s.JobID)
-				if s.Topic == "" {
+			Run: func(i JobInput, s ContentState) (deck.Mutation[ContentState], error) {
+				fmt.Printf("  [ValidateRequest] Validating job %s...\n", i.JobID)
+				if i.Topic == "" {
 					return nil, fmt.Errorf("topic is required")
 				}
-				if s.Style == "" {
+				if i.Style == "" {
 					return nil, fmt.Errorf("style is required")
 				}
 				fmt.Println("  [ValidateRequest] Valid.")
@@ -284,12 +339,12 @@ func buildDeck(rdb *redis.Client) *deck.Deck[ContentState] {
 		},
 		{
 			Name: "SubmitImageGeneration",
-			When: func(s ContentState, r deck.Result) bool {
+			When: func(i JobInput, s ContentState, r deck.Result) bool {
 				return s.Validated && s.ImageRequestID == ""
 			},
-			Run: func(s ContentState) (deck.Mutation[ContentState], error) {
+			Run: func(i JobInput, s ContentState) (deck.Mutation[ContentState], error) {
 				requestID := fmt.Sprintf("img_%s", uuid.New().String()[:8])
-				fmt.Printf("  [SubmitImageGeneration] Requesting image — request %s\n", requestID)
+				fmt.Printf("  [SubmitImageGeneration] Requesting image for %q — request %s\n", i.Topic, requestID)
 				return deck.Suspended(func(s *ContentState) {
 					s.ImageRequestID = requestID
 				}), nil
@@ -297,12 +352,12 @@ func buildDeck(rdb *redis.Client) *deck.Deck[ContentState] {
 		},
 		{
 			Name: "SubmitCopyGeneration",
-			When: func(s ContentState, r deck.Result) bool {
+			When: func(i JobInput, s ContentState, r deck.Result) bool {
 				return s.Validated && s.CopyRequestID == ""
 			},
-			Run: func(s ContentState) (deck.Mutation[ContentState], error) {
+			Run: func(i JobInput, s ContentState) (deck.Mutation[ContentState], error) {
 				requestID := fmt.Sprintf("copy_%s", uuid.New().String()[:8])
-				fmt.Printf("  [SubmitCopyGeneration] Requesting %s — request %s\n", s.Style, requestID)
+				fmt.Printf("  [SubmitCopyGeneration] Requesting %s — request %s\n", i.Style, requestID)
 				return deck.Suspended(func(s *ContentState) {
 					s.CopyRequestID = requestID
 				}), nil
@@ -310,10 +365,10 @@ func buildDeck(rdb *redis.Client) *deck.Deck[ContentState] {
 		},
 		{
 			Name: "CollectImage",
-			When: func(s ContentState, r deck.Result) bool {
+			When: func(i JobInput, s ContentState, r deck.Result) bool {
 				return s.ImageRequestID != "" && s.ImageURL == ""
 			},
-			Run: func(s ContentState) (deck.Mutation[ContentState], error) {
+			Run: func(i JobInput, s ContentState) (deck.Mutation[ContentState], error) {
 				ctx := context.Background()
 				url, err := rdb.Get(ctx, resultKey(s.ImageRequestID)).Result()
 				if err == redis.Nil {
@@ -331,10 +386,10 @@ func buildDeck(rdb *redis.Client) *deck.Deck[ContentState] {
 		},
 		{
 			Name: "CollectCopy",
-			When: func(s ContentState, r deck.Result) bool {
+			When: func(i JobInput, s ContentState, r deck.Result) bool {
 				return s.CopyRequestID != "" && s.CopyText == ""
 			},
-			Run: func(s ContentState) (deck.Mutation[ContentState], error) {
+			Run: func(i JobInput, s ContentState) (deck.Mutation[ContentState], error) {
 				ctx := context.Background()
 				text, err := rdb.Get(ctx, resultKey(s.CopyRequestID)).Result()
 				if err == redis.Nil {
@@ -352,12 +407,12 @@ func buildDeck(rdb *redis.Client) *deck.Deck[ContentState] {
 		},
 		{
 			Name: "PublishContent",
-			When: func(s ContentState, r deck.Result) bool {
+			When: func(i JobInput, s ContentState, r deck.Result) bool {
 				return s.ImageURL != "" && s.CopyText != "" && s.PublishedURL == ""
 			},
-			Run: func(s ContentState) (deck.Mutation[ContentState], error) {
+			Run: func(i JobInput, s ContentState) (deck.Mutation[ContentState], error) {
 				fmt.Println("  [PublishContent] Assembling and publishing content...")
-				publishedURL := fmt.Sprintf("https://localhost/posts/%s", s.JobID)
+				publishedURL := fmt.Sprintf("https://localhost/posts/%s", i.JobID)
 				fmt.Printf("  [PublishContent] Published to %s\n", publishedURL)
 				return deck.Complete(func(s *ContentState) {
 					s.PublishedURL = publishedURL
@@ -373,9 +428,13 @@ func buildDeck(rdb *redis.Client) *deck.Deck[ContentState] {
 	return d
 }
 
-// waitForField polls a saved job's snapshot until a field is populated.
-// Simulates an external API looking up the request ID.
-func waitForField(ctx context.Context, rdb *redis.Client, d *deck.Deck[ContentState], jobID, field string) string {
+// waitForStateField polls a saved job's snapshot until a state field is
+// populated. Simulates an external API looking up the request ID it was
+// asked to fulfil. (Request IDs live in state, not input — they're produced
+// by the Submit cues during the run.)
+//
+// Returns the field value, or "" if ctx is cancelled before it appears.
+func waitForStateField(ctx context.Context, rdb *redis.Client, d *deck.Deck[JobInput, ContentState], jobID, field string) string {
 	for {
 		data, err := rdb.Get(ctx, snapshotKey(jobID)).Bytes()
 		if err == nil {
@@ -393,18 +452,22 @@ func waitForField(ctx context.Context, rdb *redis.Client, d *deck.Deck[ContentSt
 				}
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ""
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 }
 
-func printComplete(state *ContentState, result deck.Result) {
+func printComplete(input JobInput, state *ContentState, result deck.Result) {
 	fmt.Println()
 	fmt.Println("==========================================================")
 	fmt.Println("  CONTENT PUBLISHED SUCCESSFULLY")
 	fmt.Println("==========================================================")
-	fmt.Printf("  Job:   %s\n", state.JobID)
-	fmt.Printf("  Topic: %s\n", state.Topic)
-	fmt.Printf("  Style: %s\n", state.Style)
+	fmt.Printf("  Job:   %s\n", input.JobID)
+	fmt.Printf("  Topic: %s\n", input.Topic)
+	fmt.Printf("  Style: %s\n", input.Style)
 	fmt.Printf("  Image: %s\n", state.ImageURL)
 	fmt.Printf("  URL:   %s\n", state.PublishedURL)
 	fmt.Println()
