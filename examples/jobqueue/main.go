@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -91,7 +92,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to start Redis: %v", err)
 	}
-	defer redisContainer.Terminate(ctx)
+	defer func() { _ = redisContainer.Terminate(ctx) }()
 
 	connStr, err := redisContainer.ConnectionString(ctx)
 	if err != nil {
@@ -102,7 +103,7 @@ func main() {
 		log.Fatalf("Failed to parse Redis URL: %v", err)
 	}
 	rdb := redis.NewClient(opts)
-	defer rdb.Close()
+	defer func() { _ = rdb.Close() }()
 	fmt.Println("Redis ready.")
 	fmt.Println()
 
@@ -292,7 +293,7 @@ func workerLoop(ctx context.Context, rdb *redis.Client, d *deck.Deck[JobInput, C
 // simulate it with Redis pub/sub.
 func webhookHandler(ctx context.Context, rdb *redis.Client) {
 	sub := rdb.Subscribe(ctx, webhookChannel)
-	defer sub.Close()
+	defer func() { _ = sub.Close() }()
 
 	for msg := range sub.Channel() {
 		var webhook struct {
@@ -371,7 +372,7 @@ func buildDeck(rdb *redis.Client) *deck.Deck[JobInput, ContentState] {
 			Run: func(i JobInput, s ContentState) (deck.Mutation[ContentState], error) {
 				ctx := context.Background()
 				url, err := rdb.Get(ctx, resultKey(s.ImageRequestID)).Result()
-				if err == redis.Nil {
+				if errors.Is(err, redis.Nil) {
 					fmt.Printf("  [CollectImage] Request %s not ready yet — suspending\n", s.ImageRequestID)
 					return deck.Suspended(func(s *ContentState) {}), nil
 				}
@@ -392,7 +393,7 @@ func buildDeck(rdb *redis.Client) *deck.Deck[JobInput, ContentState] {
 			Run: func(i JobInput, s ContentState) (deck.Mutation[ContentState], error) {
 				ctx := context.Background()
 				text, err := rdb.Get(ctx, resultKey(s.CopyRequestID)).Result()
-				if err == redis.Nil {
+				if errors.Is(err, redis.Nil) {
 					fmt.Printf("  [CollectCopy] Request %s not ready yet — suspending\n", s.CopyRequestID)
 					return deck.Suspended(func(s *ContentState) {}), nil
 				}

@@ -110,15 +110,18 @@ type regularMutation[S any] struct {
 	mutate func(*S)
 }
 
-func (m *regularMutation[S]) apply(s *S)        { m.mutate(s) }
-func (m *regularMutation[S]) isSuspended() bool { return false }
+// These methods satisfy the Mutation[S] interface and are dispatched via the
+// interface in runner.wait. golangci-lint's `unused` analyzer doesn't trace
+// generic interface dispatch, so it flags them — they are not actually unused.
+func (m *regularMutation[S]) apply(s *S)        { m.mutate(s) }  //nolint:unused
+func (m *regularMutation[S]) isSuspended() bool { return false } //nolint:unused
 
 type suspendedMutation[S any] struct {
 	mutate func(*S)
 }
 
-func (m *suspendedMutation[S]) apply(s *S)        { m.mutate(s) }
-func (m *suspendedMutation[S]) isSuspended() bool { return true }
+func (m *suspendedMutation[S]) apply(s *S)        { m.mutate(s) } //nolint:unused
+func (m *suspendedMutation[S]) isSuspended() bool { return true } //nolint:unused
 
 // Complete wraps a state-update function as a Mutation. The cue is recorded
 // in Result.CompletedCues and will not fire again in this run.
@@ -185,7 +188,11 @@ type snapshot[S any] struct {
 // package level.
 func (d *Deck[I, S]) Export(state *S, result Result) ([]byte, error) {
 	snap := snapshot[S]{State: *state, Result: result}
-	return json.Marshal(snap)
+	data, err := json.Marshal(snap)
+	if err != nil {
+		return nil, fmt.Errorf("marshal snapshot: %w", err)
+	}
+	return data, nil
 }
 
 // Import deserializes a snapshot produced by Export, returning the state and
@@ -348,7 +355,7 @@ func (r *runner[I, S]) isStable() bool {
 func (r *runner[I, S]) wait() error {
 	select {
 	case <-r.ctx.Done():
-		return r.ctx.Err()
+		return fmt.Errorf("deck run cancelled: %w", r.ctx.Err())
 	case result := <-r.done:
 		r.activeCount--
 		if result.mutation != nil {
