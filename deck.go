@@ -74,6 +74,12 @@ type Cue[I, S any] struct {
 	// Use Complete for normal mutations. Use Suspended to apply the
 	// mutation and signal the Deck to stop after the current cycle drains —
 	// typical for cues that kick off long-running async work.
+	//
+	// If Run returns a non-nil error, the Deck stops, drains other active
+	// cues, and surfaces the error from Deck.Run wrapped with the cue's name.
+	// The returned mutation is discarded and the cue is not recorded in
+	// Result.CompletedCues. If multiple concurrent cues error, the first
+	// observed error wins.
 	Run func(I, S) (Mutation[S], error)
 }
 
@@ -207,12 +213,16 @@ func (d *Deck[I, S]) Import(data []byte) (*S, Result, error) {
 }
 
 // Run executes the Deck with the given input and state. It returns when no
-// more cues trigger, when a cue returns a Suspended mutation, or when the
-// context is cancelled.
+// more cues trigger, when a cue returns a Suspended mutation, when a cue
+// returns an error, or when the context is cancelled.
 //
 // Input is passed by value to every When and Run; the library does not
 // mutate it and cues must not. State is mutated by cues' returned Mutations
-// and updated in-place on successful return.
+// and updated in-place on successful return. On error (cue error or context
+// cancellation), the caller's *state is not overwritten with the run's
+// working copy. Note: reference-typed fields in S (slices, maps, pointers)
+// share storage with the working copy, so mutations cues made through those
+// references remain visible regardless of error status.
 //
 // To resume a previously suspended execution, pass the Result from Import as
 // the optional prev argument. The caller provides input fresh on resume —
@@ -261,6 +271,7 @@ type runner[I, S any] struct {
 	activeCount int
 	completed   []CompletedCue
 	suspended   bool
+	runErr      error // first error returned by any cue's Run (subsequent errors are dropped)
 }
 
 type cueResult[S any] struct {
@@ -292,16 +303,24 @@ func (r *runner[I, S]) run() (Result, error) {
 		r.trigger(hits)
 
 		if r.isStable() {
-			return Result{CompletedCues: r.completed, Suspended: r.suspended}, nil
+			return Result{CompletedCues: r.completed, Suspended: r.suspended}, r.runErr
 		}
 
 		if err := r.wait(); err != nil {
 			return Result{CompletedCues: r.completed, Suspended: r.suspended}, err
 		}
 
-		if r.suspended {
+		// Either condition stops the run: drain remaining active cues so
+		// their goroutines can exit cleanly, then decide what to return.
+		// Error takes precedence over suspended — the drain itself may have
+		// captured an error from a sibling cue, so we re-check r.runErr
+		// AFTER drain rather than only before.
+		if r.suspended || r.runErr != nil {
 			if err := r.drain(); err != nil {
 				return Result{CompletedCues: r.completed, Suspended: r.suspended}, err
+			}
+			if r.runErr != nil {
+				return Result{CompletedCues: r.completed}, r.runErr
 			}
 			return Result{CompletedCues: r.completed, Suspended: true}, nil
 		}
@@ -358,6 +377,15 @@ func (r *runner[I, S]) wait() error {
 		return fmt.Errorf("deck run cancelled: %w", r.ctx.Err())
 	case result := <-r.done:
 		r.activeCount--
+		// A cue's error takes precedence over its mutation: if Run returned
+		// an error, the cue is treated as failed — its mutation is discarded
+		// and it is not recorded in CompletedCues.
+		if result.err != nil {
+			if r.runErr == nil {
+				r.runErr = fmt.Errorf("cue %s: %w", result.cueName, result.err)
+			}
+			return nil
+		}
 		if result.mutation != nil {
 			result.mutation.apply(r.state)
 			if result.mutation.isSuspended() {

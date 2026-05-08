@@ -3,6 +3,7 @@ package deck_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -1580,6 +1581,242 @@ func TestDeck_Run_PointerInputIsSupported(t *testing.T) {
 	// Then the cue receives the pointer and can read fields through it
 	require.NoError(t, err)
 	assert.Equal(t, 11, state.Length)
+}
+
+// --- Cue error propagation tests ---
+
+func TestDeck_Run_PropagatesErrorFromCue(t *testing.T) {
+	// Given a cue whose Run returns an error
+	cueErr := errors.New("intentional failure")
+	cue := deck.Cue[struct{}, TestState]{
+		Name: "FailingCue",
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return nil, cueErr
+		},
+	}
+
+	sut, err := deck.New(cue)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	// When the deck runs
+	state := &TestState{Count: 5}
+	result, err := sut.Run(ctx, struct{}{}, state)
+
+	// Then the error is propagated, wrapping the original
+	require.Error(t, err)
+	require.ErrorIs(t, err, cueErr, "Original error should be in the chain via %w")
+	assert.Contains(t, err.Error(), "FailingCue", "Error should identify which cue failed")
+
+	// And the cue is NOT recorded in CompletedCues
+	assert.False(t, result.Completed("FailingCue"), "Errored cue must not appear as completed")
+
+	// And the caller's state is unchanged (state is not copied back on error)
+	assert.Equal(t, 5, state.Count, "State should not be modified when the run errors")
+}
+
+func TestDeck_Run_DoesNotStallWhenUpstreamCueErrors(t *testing.T) {
+	// Given an upstream cue that errors and a downstream cue that depends on it
+	// completing, the deck must not stall waiting for the downstream — it must
+	// surface the upstream error and return promptly.
+	upstreamErr := errors.New("upstream failed")
+	upstream := deck.Cue[struct{}, TestState]{
+		Name: "Upstream",
+		When: func(_ struct{}, s TestState, _ deck.Result) bool {
+			return s.Count == 0
+		},
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return nil, upstreamErr
+		},
+	}
+
+	downstream := deck.Cue[struct{}, TestState]{
+		Name: "Downstream",
+		When: func(_ struct{}, _ TestState, r deck.Result) bool {
+			return r.Completed("Upstream")
+		},
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) { s.Count = 99 }), nil
+		},
+	}
+
+	sut, err := deck.New(upstream, downstream)
+	require.NoError(t, err)
+
+	// Use a generous timeout so we can distinguish "stalled" from "errored
+	// promptly". A stalled deck would hit ctx cancellation; an errored deck
+	// returns far sooner.
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	state := &TestState{Count: 0}
+	_, err = sut.Run(ctx, struct{}{}, state)
+	elapsed := time.Since(start)
+
+	// Then the deck returns the upstream error rather than stalling on
+	// Downstream's When predicate.
+	require.Error(t, err)
+	require.ErrorIs(t, err, upstreamErr, "Should return upstream error, not ctx error")
+	assert.Less(t, elapsed, 200*time.Millisecond, "Should return promptly, not stall waiting for downstream")
+
+	// And the downstream cue never ran — state is unchanged.
+	assert.Equal(t, 0, state.Count, "Downstream cue must not have run")
+}
+
+func TestDeck_Run_ErrorPropagatesAlongsideSlowerConcurrentCue(t *testing.T) {
+	// Given two concurrent cues — one fast-failing, one slow-succeeding —
+	// the deck must return the failure error and not be blocked by the slower
+	// cue still running.
+	failErr := errors.New("fast fail")
+	fastFail := deck.Cue[struct{}, TestState]{
+		Name: "FastFail",
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return nil, failErr
+		},
+	}
+
+	slowSucceed := deck.Cue[struct{}, TestState]{
+		Name: "SlowSucceed",
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			// Sleep so this cue finishes after FastFail's error has already
+			// been observed by the runner.
+			time.Sleep(50 * time.Millisecond)
+			return deck.Complete(func(s *TestState) { s.Count = 99 }), nil
+		},
+	}
+
+	sut, err := deck.New(fastFail, slowSucceed)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	// When the deck runs
+	state := &TestState{Count: 5}
+	_, err = sut.Run(ctx, struct{}{}, state)
+
+	// Then the fast cue's error wins
+	require.Error(t, err)
+	require.ErrorIs(t, err, failErr)
+
+	// And the caller's state is unchanged — the slow cue's mutation, even if
+	// it ran to completion, must not be visible because the run errored.
+	assert.Equal(t, 5, state.Count, "State must not be copied back when the run errors")
+}
+
+func TestDeck_Run_ErrorIsNotDroppedWhenSuspendArrivesFirst(t *testing.T) {
+	// Given two concurrent cues fired in the same cycle: one suspends quickly,
+	// the other errors a short moment later. The runner observes the suspend
+	// first, takes the suspend-then-drain branch, and consumes the error
+	// during drain. The error must not be dropped — it must propagate from
+	// Deck.Run.
+	cueErr := errors.New("late failure")
+
+	fastSuspend := deck.Cue[struct{}, TestState]{
+		Name: "FastSuspend",
+		When: func(_ struct{}, s TestState, _ deck.Result) bool {
+			return s.Count == 0
+		},
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return deck.Suspended(func(s *TestState) { s.Count = 7 }), nil
+		},
+	}
+
+	slowFail := deck.Cue[struct{}, TestState]{
+		Name: "SlowFail",
+		When: func(_ struct{}, s TestState, _ deck.Result) bool {
+			return s.Count == 0
+		},
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			time.Sleep(30 * time.Millisecond)
+			return nil, cueErr
+		},
+	}
+
+	sut, err := deck.New(fastSuspend, slowFail)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	state := &TestState{Count: 0}
+	result, err := sut.Run(ctx, struct{}{}, state)
+
+	// Then the error from the slow cue is surfaced — not silently dropped by
+	// the suspend-then-drain path.
+	require.Error(t, err)
+	require.ErrorIs(t, err, cueErr, "Error captured during suspend-drain must propagate")
+	assert.Contains(t, err.Error(), "SlowFail")
+
+	// And the caller's state is not copied back, even though FastSuspend's
+	// mutation succeeded — the run errored as a whole.
+	assert.Equal(t, 0, state.Count, "State must not be copied back when the run errors")
+	assert.False(t, result.Completed("SlowFail"), "Errored cue must not be completed")
+}
+
+func TestDeck_Run_ErrorTakesPrecedenceOverSuspendedMutation(t *testing.T) {
+	// Given a single cue that returns BOTH a Suspended mutation and an error,
+	// the error wins: the mutation is discarded, the cue is not recorded in
+	// CompletedCues, and Result.Suspended is not set.
+	cueErr := errors.New("boom")
+	cue := deck.Cue[struct{}, TestState]{
+		Name: "Both",
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return deck.Suspended(func(s *TestState) { s.Count = 99 }), cueErr
+		},
+	}
+
+	sut, err := deck.New(cue)
+	require.NoError(t, err)
+
+	state := &TestState{Count: 5}
+	result, err := sut.Run(context.Background(), struct{}{}, state)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, cueErr)
+
+	assert.Equal(t, 5, state.Count, "Mutation must be discarded when err != nil")
+	assert.False(t, result.Suspended, "Run must not be marked Suspended when the cue erred")
+	assert.False(t, result.Completed("Both"), "Errored cue must not appear as completed")
+}
+
+func TestDeck_Run_FirstConcurrentErrorIsReturned(t *testing.T) {
+	// Given two cues that both return errors concurrently, ordered
+	// deterministically by sleep, only the first error is wrapped and returned.
+	firstErr := errors.New("first")
+	secondErr := errors.New("second")
+
+	fastErr := deck.Cue[struct{}, TestState]{
+		Name: "FastErr",
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return nil, firstErr
+		},
+	}
+
+	slowErr := deck.Cue[struct{}, TestState]{
+		Name: "SlowErr",
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			time.Sleep(30 * time.Millisecond)
+			return nil, secondErr
+		},
+	}
+
+	sut, err := deck.New(fastErr, slowErr)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	state := &TestState{Count: 5}
+	_, err = sut.Run(ctx, struct{}{}, state)
+
+	require.Error(t, err)
+	require.ErrorIs(t, err, firstErr, "First-observed error must be the wrapped one")
+	require.NotErrorIs(t, err, secondErr, "Second error must not be wrapped (first wins)")
+	assert.Contains(t, err.Error(), "FastErr")
 }
 
 func assertExecutionOrder(t *testing.T, result deck.Result, order ...string) {
