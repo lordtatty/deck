@@ -1906,7 +1906,7 @@ func TestDeck_Run_SerialSpawn_RunsEachCueToCompletionBeforeTheNext(t *testing.T)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	state := &TestState{}
-	result, err := sut.Run(ctx, struct{}{}, state)
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
 
 	// Then no cue overlapped another, and every cue still completed
 	require.NoError(t, err)
@@ -1919,34 +1919,131 @@ func TestDeck_Run_SerialSpawn_RunsEachCueToCompletionBeforeTheNext(t *testing.T)
 	assert.Len(t, result.CompletedCues, 3)
 }
 
-func TestDeck_Run_SerialSpawn_CompletesEvenWhenContextIsAlreadyCancelled(t *testing.T) {
-	// Given a serial Spawn, every result is buffered before Run checks for
-	// one, so a context cancelled before Run even starts must go unnoticed.
-	var cues []deck.Cue[struct{}, TestState]
-	for i := 0; i < 10; i++ {
-		cues = append(cues, deck.Cue[struct{}, TestState]{
-			Name: fmt.Sprintf("Cue%d", i),
-			Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
-				return deck.Complete(func(s *TestState) { s.Count++ }), nil
-			},
+// executionMode configures a Deck for one of the three ways a run can be
+// driven: plain goroutines, a serial Spawn, or a cooperative scheduler.
+type executionMode struct {
+	name  string
+	apply func(*deck.Deck[struct{}, TestState])
+}
+
+func executionModes() []executionMode {
+	return []executionMode{
+		{"goroutine", func(*deck.Deck[struct{}, TestState]) {}},
+		{"serial", func(d *deck.Deck[struct{}, TestState]) {
+			d.Spawn = func(fn func()) { fn() }
+		}},
+		{"scheduler", func(d *deck.Deck[struct{}, TestState]) {
+			sched := &coopScheduler{}
+			d.Spawn, d.Await = sched.spawn, sched.await
+		}},
+	}
+}
+
+// runBounded calls Run on its own goroutine and fails the test if it has not
+// returned within five seconds. A serial Spawn or an Await is never rescued
+// by ctx, so a hang would otherwise stall the whole package run.
+func runBounded[I, S any](t *testing.T, d *deck.Deck[I, S], ctx context.Context, input I, state *S, prev ...deck.Result) (deck.Result, error) {
+	t.Helper()
+	type outcome struct {
+		result deck.Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := d.Run(ctx, input, state, prev...)
+		done <- outcome{result: result, err: err}
+	}()
+	select {
+	case o := <-done:
+		return o.result, o.err
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return: a serial Spawn or an Await cannot be rescued by ctx")
+		return deck.Result{}, nil
+	}
+}
+
+func TestDeck_Run_AlreadyCancelledContext_TriggersNothing(t *testing.T) {
+	marker := t.Name()
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given a context cancelled before Run is called
+			var mu sync.Mutex
+			triggered := 0
+			cue := deck.Cue[struct{}, TestState]{
+				Name: "Cue",
+				Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
+					mu.Lock()
+					triggered++
+					mu.Unlock()
+					return deck.Complete(func(s *TestState) { s.Count = 1 }), nil
+				},
+			}
+			sut, err := deck.New(cue)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			// When the deck runs
+			state := &TestState{Count: 42}
+			result, err := runBounded(t, sut, ctx, struct{}{}, state)
+
+			// Then no cue is started and state is untouched
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Empty(t, result.CompletedCues)
+			assert.Equal(t, 42, state.Count)
+			require.Eventually(t, func() bool { return cueGoroutines(marker) == 0 }, 2*time.Second, 5*time.Millisecond)
+			mu.Lock()
+			defer mu.Unlock()
+			assert.Zero(t, triggered, "cue was started under a dead context")
 		})
 	}
+}
 
-	sut, err := deck.New(cues...)
-	require.NoError(t, err)
-	sut.Spawn = func(fn func()) { fn() }
+func TestDeck_Run_CancelledFromInsideACue_TriggersNoFurtherCues(t *testing.T) {
+	marker := t.Name()
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given a chain whose first cue cancels the run's context
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var mu sync.Mutex
+			secondStarted := 0
+			first := deck.Cue[struct{}, TestState]{
+				Name: "First",
+				Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
+					cancel()
+					return deck.Complete(func(s *TestState) { s.Count = 1 }), nil
+				},
+			}
+			second := deck.Cue[struct{}, TestState]{
+				Name: "Second",
+				When: func(_ struct{}, s TestState, r deck.Result) bool { return r.Completed("First") },
+				Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
+					mu.Lock()
+					secondStarted++
+					mu.Unlock()
+					return deck.Complete(func(s *TestState) { s.Count = 2 }), nil
+				},
+			}
+			sut, err := deck.New(first, second)
+			require.NoError(t, err)
+			mode.apply(sut)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+			// When the deck runs
+			state := &TestState{}
+			_, err = runBounded(t, sut, ctx, struct{}{}, state)
 
-	// When the deck runs under that dead context
-	state := &TestState{}
-	result, err := sut.Run(ctx, struct{}{}, state)
-
-	// Then the run finishes normally — cancellation never got a look in
-	require.NoError(t, err)
-	assert.Len(t, result.CompletedCues, 10)
-	assert.Equal(t, 10, state.Count)
+			// Then the next cue is never started and state is not copied back
+			require.ErrorIs(t, err, context.Canceled)
+			assert.Equal(t, 0, state.Count)
+			require.Eventually(t, func() bool { return cueGoroutines(marker) == 0 }, 2*time.Second, 5*time.Millisecond)
+			mu.Lock()
+			defer mu.Unlock()
+			assert.Zero(t, secondStarted, "a cue was started after the context was cancelled")
+		})
+	}
 }
 
 // coopScheduler models a cooperative scheduler like Temporal's deterministic
@@ -1999,7 +2096,7 @@ func TestDeck_Run_Await_HandsEveryCueToTheSchedulerBeforeAnyRuns(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	state := &TestState{}
-	result, err := sut.Run(ctx, struct{}{}, state)
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
 
 	// Then all three cues reached the scheduler before any of them executed —
 	// the fan-out shape that puts three Temporal activities in flight at once
@@ -2030,55 +2127,70 @@ func TestDeck_Run_Await_SchedulerCancellationSurfacesAsError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	state := &TestState{Count: 42}
-	_, err = sut.Run(ctx, struct{}{}, state)
+	_, err = runBounded(t, sut, ctx, struct{}{}, state)
 
 	// Then the scheduler's error is surfaced and state is not copied back,
 	// with the cue still sitting unrun in the scheduler's queue
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "workflow canceled")
+	assert.Contains(t, err.Error(), "aborted by Await: workflow canceled")
 	assert.Equal(t, 42, state.Count)
 	assert.Len(t, sched.queue, 1)
 }
 
 func TestDeck_Run_Cancellation_DoesNotLeakCueGoroutines(t *testing.T) {
-	// Given a cue that outlives its context
+	// Given cues that block until released, each abandoned by a cancelled run
+	const runs = 20
+	started := make(chan struct{}, runs)
+	release := make(chan struct{})
 	cue := deck.Cue[struct{}, TestState]{
-		Name: "Slow",
+		Name: "Blocked",
 		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
-			time.Sleep(50 * time.Millisecond)
+			started <- struct{}{}
+			<-release
 			return deck.Complete(func(s *TestState) { s.Count++ }), nil
 		},
 	}
-
 	sut, err := deck.New(cue)
 	require.NoError(t, err)
 
-	// When many runs are abandoned mid-cue
-	const runs = 20
+	// When every run is cancelled as soon as its cue has started
 	for i := 0; i < runs; i++ {
-		func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-			defer cancel()
-			_, err := sut.Run(ctx, struct{}{}, &TestState{})
-			require.Error(t, err)
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-started
+			cancel()
 		}()
+		_, err := sut.Run(ctx, struct{}{}, &TestState{})
+		require.ErrorIs(t, err, context.Canceled)
 	}
+	require.Equal(t, runs, cueGoroutines(t.Name()), "every abandoned cue should still be parked")
 
-	// Then every cue goroutine still finishes and exits, rather than parking
-	// forever on a send nobody is left to receive
-	deadline := time.Now().Add(2 * time.Second)
-	for deckGoroutines() > 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	assert.Zero(t, deckGoroutines(), "cue goroutines leaked after %d abandoned runs", runs)
+	// Then, once released, each cue goroutine finishes and exits rather than
+	// parking forever on a send nobody is left to receive
+	close(release)
+	assert.Eventually(t, func() bool { return cueGoroutines(t.Name()) == 0 },
+		2*time.Second, 5*time.Millisecond, "cue goroutines leaked after %d abandoned runs", runs)
 }
 
-// deckGoroutines counts goroutines inside deck's runner, ignoring the
-// unrelated activity runtime.NumGoroutine would include.
-func deckGoroutines() int {
+// cueGoroutines counts goroutines still running a cue spawned by the named
+// test: those with a deck runner frame beneath that test's closure.
+func cueGoroutines(testName string) int {
 	buf := make([]byte, 1<<20)
-	n := runtime.Stack(buf, true)
-	return strings.Count(string(buf[:n]), "lordtatty/deck.(*runner[")
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	count := 0
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(g, "lordtatty/deck.(*runner[") && strings.Contains(g, testName) {
+			count++
+		}
+	}
+	return count
 }
 
 func TestDeck_Run_Await_DrainsRemainingCuesThroughTheScheduler(t *testing.T) {
@@ -2107,7 +2219,7 @@ func TestDeck_Run_Await_DrainsRemainingCuesThroughTheScheduler(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	state := &TestState{}
-	result, err := sut.Run(ctx, struct{}{}, state)
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
 
 	// Then the run suspends, and the still-queued cue is drained by yielding
 	// to the scheduler rather than by blocking on it
@@ -2145,7 +2257,7 @@ func TestDeck_Run_SerialSpawn_RunsDependentCuesAcrossCycles(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	state := &TestState{}
-	result, err := sut.Run(ctx, struct{}{}, state)
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
 
 	// Then the chain still advances one cycle at a time: a cue's mutation is
 	// absorbed before the next check sees it
@@ -2181,7 +2293,7 @@ func TestDeck_Run_Await_RunsDependentCuesAcrossCycles(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	state := &TestState{}
-	result, err := sut.Run(ctx, struct{}{}, state)
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
 
 	// Then the chain advances across cycles without ever blocking natively
 	require.NoError(t, err)
@@ -2208,7 +2320,7 @@ func TestDeck_Run_SerialSpawn_SurfacesCueErrorAndDiscardsItsMutation(t *testing.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	state := &TestState{Count: 42}
-	result, err := sut.Run(ctx, struct{}{}, state)
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
 
 	// Then the error wins: the mutation is dropped and the cue is not recorded
 	require.Error(t, err)
@@ -2236,7 +2348,7 @@ func TestDeck_Run_Await_SurfacesCueErrorAndDiscardsItsMutation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	state := &TestState{Count: 42}
-	result, err := sut.Run(ctx, struct{}{}, state)
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
 
 	// Then the error surfaces from the scheduled cue just the same
 	require.Error(t, err)
@@ -2273,7 +2385,7 @@ func TestDeck_Run_SerialSpawn_SuspendsExportsAndResumes(t *testing.T) {
 
 	// When the first run suspends and its snapshot is round-tripped
 	state := &TestState{}
-	first, err := sut.Run(ctx, struct{}{}, state)
+	first, err := runBounded(t, sut, ctx, struct{}{}, state)
 	require.NoError(t, err)
 	require.True(t, first.Suspended)
 	require.Equal(t, 1, state.Count)
@@ -2284,7 +2396,7 @@ func TestDeck_Run_SerialSpawn_SuspendsExportsAndResumes(t *testing.T) {
 	require.NoError(t, err)
 
 	// And the deck is resumed from it
-	second, err := sut.Run(ctx, struct{}{}, resumedState, prev)
+	second, err := runBounded(t, sut, ctx, struct{}{}, resumedState, prev)
 
 	// Then the collecting cue runs and the work finishes
 	require.NoError(t, err)
@@ -2313,28 +2425,13 @@ func TestDeck_Run_SerialSpawn_DoesNotDeadlockWhenEveryCueTriggersAtOnce(t *testi
 	sut.Spawn = func(fn func()) { fn() }
 
 	// When the deck runs
-	type outcome struct {
-		result deck.Result
-		err    error
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	result, err := runBounded(t, sut, ctx, struct{}{}, &TestState{})
 
-	done := make(chan outcome, 1)
-	go func() {
-		result, runErr := sut.Run(ctx, struct{}{}, &TestState{})
-		done <- outcome{result: result, err: runErr}
-	}()
-
-	// Then it finishes; any other failure is reported as itself rather than
-	// as a deadlock.
-	select {
-	case got := <-done:
-		require.NoError(t, got.err)
-		assert.Len(t, got.result.CompletedCues, cueCount)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run deadlocked: result buffer cannot hold every cue's result")
-	}
+	// Then it finishes rather than parking on a send nobody can receive
+	require.NoError(t, err)
+	assert.Len(t, result.CompletedCues, cueCount)
 }
 
 func TestDeck_Run_Await_ReturningWithoutAResultFailsRatherThanBlocking(t *testing.T) {
@@ -2357,18 +2454,80 @@ func TestDeck_Run_Await_ReturningWithoutAResultFailsRatherThanBlocking(t *testin
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	done := make(chan error, 1)
-	go func() {
-		_, runErr := sut.Run(ctx, struct{}{}, &TestState{})
-		done <- runErr
-	}()
+	_, err = runBounded(t, sut, ctx, struct{}{}, &TestState{})
 
 	// Then Run fails with a diagnosable error instead of blocking forever
-	select {
-	case runErr := <-done:
-		require.Error(t, runErr)
-		assert.Contains(t, runErr.Error(), "Await returned")
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run blocked forever after Await returned with no result ready")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "Await returned")
+}
+
+func TestDeck_Run_HooksMayBeReassignedAfterAnAbandonedRun(t *testing.T) {
+	// Given a cue still running after its run was cancelled
+	started := make(chan struct{})
+	cue := deck.Cue[struct{}, TestState]{
+		Name: "Lingering",
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
+			close(started)
+			time.Sleep(30 * time.Millisecond)
+			return deck.Complete(func(s *TestState) { s.Count++ }), nil
+		},
 	}
+	sut, err := deck.New(cue)
+	require.NoError(t, err)
+	sut.Now = time.Now
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-started
+		cancel()
+	}()
+	_, err = sut.Run(ctx, struct{}{}, &TestState{})
+	require.ErrorIs(t, err, context.Canceled)
+
+	// When a hook is reassigned for the next run while that cue is still live
+	sut.Now = func() time.Time { return time.Unix(0, 0) }
+
+	// Then the lingering cue finishes without racing on the hook — the run
+	// took its own copy when it started (-race would report otherwise)
+	assert.Eventually(t, func() bool { return cueGoroutines(t.Name()) == 0 }, 2*time.Second, 5*time.Millisecond)
+}
+
+func TestDeck_Run_Await_CueErrorSurvivesAnAbortedDrain(t *testing.T) {
+	// Given one cue that fails while another is still queued, and a
+	// scheduler that is cancelled during the drain
+	boom := errors.New("boom")
+	sched := &coopScheduler{}
+	failing := deck.Cue[struct{}, TestState]{
+		Name: "Failing",
+		Run:  func(_ struct{}, s TestState) (deck.Mutation[TestState], error) { return nil, boom },
+	}
+	queued := deck.Cue[struct{}, TestState]{
+		Name: "Queued",
+		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
+			return deck.Complete(func(s *TestState) { s.Count++ }), nil
+		},
+	}
+	sut, err := deck.New(failing, queued)
+	require.NoError(t, err)
+	sut.Spawn = sched.spawn
+	awaits := 0
+	sut.Await = func(cond func() bool) error {
+		awaits++
+		if awaits == 1 {
+			return sched.await(cond)
+		}
+		return errors.New("workflow canceled")
+	}
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, err := runBounded(t, sut, ctx, struct{}{}, &TestState{})
+
+	// Then the cue's error is the root cause reported, with the drain's
+	// cancellation alongside rather than in its place
+	require.ErrorIs(t, err, boom)
+	assert.Contains(t, err.Error(), "workflow canceled")
+	assert.False(t, result.Suspended)
 }

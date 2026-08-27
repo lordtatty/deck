@@ -56,8 +56,7 @@ import (
 //
 // Now, Spawn and Await are optional hooks for running where ordinary Go
 // concurrency is not allowed, such as a durable-execution workflow. Set them
-// before the first Run and never reassign them: a cue abandoned by a
-// cancelled run may still be reading them.
+// before calling Run; each run takes its own copy of them as it starts.
 type Deck[I, S any] struct {
 	cues []Cue[I, S]
 
@@ -76,14 +75,16 @@ type Deck[I, S any] struct {
 	// A serial Spawn — one that calls the function inline — gives
 	// deterministic, single-threaded execution. A Spawn that defers to an
 	// engine's scheduler (Temporal's workflow.Go) runs cues concurrently and
-	// must be paired with Await.
+	// must be paired with Await; where the engine hands the scheduled
+	// function its own context, the adapter must pass that on to the cue.
 	Spawn func(func())
 
 	// Await yields to the caller's scheduler until cond returns true, and
 	// aborts the run if it returns an error. Nil means Run blocks on a plain
-	// channel receive. Set it whenever Spawn defers to an engine's scheduler,
-	// where blocking natively would stall every cue the engine has yet to run.
-	// cond is side-effect free and may be called any number of times.
+	// channel receive. Set it exactly when Spawn defers to an engine's
+	// scheduler, where blocking natively would stall every cue the engine
+	// has yet to run. cond is side-effect free and may be called any number
+	// of times.
 	Await func(cond func() bool) error
 }
 
@@ -177,8 +178,8 @@ func Suspended[S any](fn func(*S)) Mutation[S] {
 	return &suspendedMutation[S]{mutate: fn}
 }
 
-// CompletedCue records a cue that finished successfully, with the wall-clock
-// times its Run started and ended.
+// CompletedCue records a cue that finished successfully and when its Run
+// started and ended, as read from Deck.Now.
 type CompletedCue struct {
 	Name      string    `json:"name"`
 	StartTime time.Time `json:"start_time"`
@@ -246,9 +247,8 @@ func (d *Deck[I, S]) Import(data []byte) (*S, Result, error) {
 // more cues trigger, when a cue returns a Suspended mutation, when a cue
 // returns an error, or when the context is cancelled.
 //
-// Cancellation applies only to the default execution mode. A Deck with a
-// serial Spawn or an Await never consults ctx; bound such runs with the
-// engine's own deadline.
+// Cancellation is checked between cycles in every execution mode; only the
+// default mode can additionally abandon cues still in flight.
 //
 // Input is passed by value to every When and Run; the library does not
 // mutate it and cues must not. State is mutated by cues' returned Mutations
@@ -296,7 +296,6 @@ func (d *Deck[I, S]) Run(ctx context.Context, input I, state *S, prev ...Result)
 
 // runner encapsulates the state of a single Deck execution.
 type runner[I, S any] struct {
-	deck        *Deck[I, S]
 	ctx         context.Context
 	input       I
 	state       *S
@@ -306,6 +305,12 @@ type runner[I, S any] struct {
 	completed   []CompletedCue
 	suspended   bool
 	runErr      error // first error returned by any cue's Run (subsequent errors are dropped)
+
+	// Hooks resolved at Run start, so a cue that outlives its run never
+	// reads the Deck's fields.
+	clock func() time.Time
+	spawn func(func())
+	await func(func() bool) error
 }
 
 type cueResult[S any] struct {
@@ -320,35 +325,37 @@ func newRunner[I, S any](d *Deck[I, S], ctx context.Context, input I, state *S) 
 	pending := make([]Cue[I, S], len(d.cues))
 	copy(pending, d.cues)
 
+	clock := d.Now
+	if clock == nil {
+		clock = time.Now
+	}
+	spawn := d.Spawn
+	if spawn == nil {
+		spawn = func(fn func()) { go fn() }
+	}
+
 	// Buffered so a serial Spawn can deliver inline before any receiver runs.
 	// Each cue runs at most once per Run, so len(cues) is always enough.
 	return &runner[I, S]{
-		deck:    d,
 		ctx:     ctx,
 		input:   input,
 		state:   state,
 		pending: pending,
 		done:    make(chan cueResult[S], len(d.cues)),
+		clock:   clock,
+		spawn:   spawn,
+		await:   d.Await,
 	}
-}
-
-func (r *runner[I, S]) now() time.Time {
-	if r.deck.Now != nil {
-		return r.deck.Now()
-	}
-	return time.Now()
-}
-
-func (r *runner[I, S]) spawn(fn func()) {
-	if r.deck.Spawn != nil {
-		r.deck.Spawn(fn)
-		return
-	}
-	go fn()
 }
 
 func (r *runner[I, S]) run() (Result, error) {
 	for {
+		// A non-blocking read, so cancellation is honoured between cycles in
+		// every execution mode.
+		if err := r.ctx.Err(); err != nil {
+			return Result{CompletedCues: r.completed, Suspended: r.suspended}, fmt.Errorf("deck run cancelled: %w", err)
+		}
+
 		hits, misses := r.check()
 		r.pending = misses
 		r.trigger(hits)
@@ -367,11 +374,14 @@ func (r *runner[I, S]) run() (Result, error) {
 		// captured an error from a sibling cue, so we re-check r.runErr
 		// AFTER drain rather than only before.
 		if r.suspended || r.runErr != nil {
-			if err := r.drain(); err != nil {
-				return Result{CompletedCues: r.completed, Suspended: r.suspended}, err
-			}
-			if r.runErr != nil {
+			drainErr := r.drain()
+			switch {
+			case r.runErr != nil && drainErr != nil:
+				return Result{CompletedCues: r.completed}, fmt.Errorf("%w; drain aborted: %w", r.runErr, drainErr)
+			case r.runErr != nil:
 				return Result{CompletedCues: r.completed}, r.runErr
+			case drainErr != nil:
+				return Result{CompletedCues: r.completed, Suspended: r.suspended}, drainErr
 			}
 			return Result{CompletedCues: r.completed, Suspended: true}, nil
 		}
@@ -403,9 +413,9 @@ func (r *runner[I, S]) trigger(cues []Cue[I, S]) {
 		// Snapshot input and state for concurrent execution
 		cue, input, state := c, r.input, *r.state
 		r.spawn(func() {
-			startTime := r.now()
+			startTime := r.clock()
 			mutation, err := cue.Run(input, state)
-			endTime := r.now()
+			endTime := r.clock()
 			r.done <- cueResult[S]{
 				cueName:   cue.Name,
 				mutation:  mutation,
@@ -425,8 +435,9 @@ func (r *runner[I, S]) isStable() bool {
 // or stalled first. Of its three paths only the final select blocks, so a
 // Deck with a serial Spawn or an Await never performs a blocking operation.
 func (r *runner[I, S]) wait() error {
-	// A buffered result wins over cancellation. Under a serial Spawn every
-	// result is already buffered, so that mode never reaches the ctx branch.
+	// Take a buffered result first. Under a serial Spawn every result is
+	// already buffered, so that mode never reaches the ctx branch; run checks
+	// ctx between cycles instead.
 	select {
 	case result := <-r.done:
 		return r.absorb(result)
@@ -436,9 +447,9 @@ func (r *runner[I, S]) wait() error {
 	// Yield to the engine's scheduler rather than block. The receive after it
 	// is non-blocking too: if the scheduler returned with nothing ready, no
 	// context could rescue a blocked receive.
-	if r.deck.Await != nil {
-		if err := r.deck.Await(func() bool { return len(r.done) > 0 }); err != nil {
-			return fmt.Errorf("deck run cancelled: %w", err)
+	if r.await != nil {
+		if err := r.await(func() bool { return len(r.done) > 0 }); err != nil {
+			return fmt.Errorf("deck run aborted by Await: %w", err)
 		}
 		select {
 		case result := <-r.done:
