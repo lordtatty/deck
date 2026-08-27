@@ -48,13 +48,59 @@ import (
 	"time"
 )
 
-// Deck is an immutable, stateless configuration of cues. Create one with New
-// and execute it with Run. The same Deck can be used for many runs.
+// Deck is a stateless configuration of cues. Create one with New and execute
+// it with Run. The same Deck can be used for many runs, concurrently — a run
+// keeps its own state and never writes back to the Deck.
 //
 // I is the immutable input type; S is the mutable state type. See the package
 // documentation for the full I/S contract.
+//
+// Now, Spawn and Await are optional hooks for running a Deck where ordinary Go
+// concurrency is not allowed — inside a durable-execution engine's workflow,
+// or in a test that needs a fixed execution order. Leave them nil for normal
+// use. Set them once, after New and before the first Run, and then leave them
+// alone: a cue abandoned by a cancelled run goes on reading them after Run has
+// returned, so even reassigning a hook "between runs" is a data race.
 type Deck[I, S any] struct {
 	cues []Cue[I, S]
+
+	// Now stamps a cue's start and end times. Nil means time.Now. Inject a
+	// deterministic clock when Run executes somewhere wall-clock reads are
+	// forbidden — a durable-execution engine's workflow, a replay test.
+	//
+	// It is called from within each cue's execution, so unless Spawn is serial
+	// it must be safe for concurrent use — a closure over a bare counter races
+	// as soon as two cues are in flight.
+	//
+	// Such a clock may not advance within a single step: Temporal's
+	// workflow.Now returns the time its workflow task started, so a cue that
+	// begins and ends inside one task reports a zero Duration.
+	Now func() time.Time
+
+	// Spawn starts a triggered cue's execution and must run the given
+	// function exactly once, now or later. Nil means a goroutine per cue.
+	//
+	// Inject a serial Spawn — one that calls the function inline — for
+	// deterministic, single-threaded ordering. Under a durable-execution
+	// engine that is the safe choice: cues run on the calling thread, so a
+	// cue closing over the engine's context is holding the right one.
+	//
+	// A Spawn that defers to an engine's scheduler (Temporal's workflow.Go)
+	// runs cues concurrently instead, but must be paired with Await. Note that
+	// such engines commonly require work to use the context handed to the
+	// scheduled function rather than the enclosing one; Deck cannot thread
+	// that context into Cue.Run, so the adapter must hand it over itself.
+	Spawn func(func())
+
+	// Await yields to the caller's scheduler until cond reports that a result
+	// is ready, standing in for a blocking channel receive. Nil means wait
+	// blocks normally. Set it whenever Spawn defers work to an engine's own
+	// scheduler: blocking natively there would stall every cue the engine has
+	// not run yet. Returning a non-nil error — the engine's cancellation —
+	// aborts the run.
+	//
+	// cond only reads; it is free of side effects and safe to call repeatedly.
+	Await func(cond func() bool) error
 }
 
 // Cue is a single unit of work. The Deck evaluates each pending cue's When
@@ -117,7 +163,7 @@ type regularMutation[S any] struct {
 }
 
 // These methods satisfy the Mutation[S] interface and are dispatched via the
-// interface in runner.wait. golangci-lint's `unused` analyzer doesn't trace
+// interface in runner.absorb. golangci-lint's `unused` analyzer doesn't trace
 // generic interface dispatch, so it flags them — they are not actually unused.
 func (m *regularMutation[S]) apply(s *S)        { m.mutate(s) }  //nolint:unused
 func (m *regularMutation[S]) isSuspended() bool { return false } //nolint:unused
@@ -216,6 +262,12 @@ func (d *Deck[I, S]) Import(data []byte) (*S, Result, error) {
 // more cues trigger, when a cue returns a Suspended mutation, when a cue
 // returns an error, or when the context is cancelled.
 //
+// Cancellation applies to the default execution mode only. A Deck configured
+// with a serial Spawn or an Await never consults ctx: a serial Spawn has
+// buffered every result before Run would look, and an Await delegates
+// cancellation to the caller's scheduler. Bound such runs with the engine's
+// own deadline rather than this context.
+//
 // Input is passed by value to every When and Run; the library does not
 // mutate it and cues must not. State is mutated by cues' returned Mutations
 // and updated in-place on successful return. On error (cue error or context
@@ -286,14 +338,33 @@ func newRunner[I, S any](d *Deck[I, S], ctx context.Context, input I, state *S) 
 	pending := make([]Cue[I, S], len(d.cues))
 	copy(pending, d.cues)
 
+	// Buffered to hold every cue's result, so a serial Spawn can deliver
+	// inline without deadlocking against a receiver that hasn't started.
+	// Each cue runs at most once per Run, so len(cues) is enough for any Spawn
+	// that honours its exactly-once contract.
 	return &runner[I, S]{
 		deck:    d,
 		ctx:     ctx,
 		input:   input,
 		state:   state,
 		pending: pending,
-		done:    make(chan cueResult[S]),
+		done:    make(chan cueResult[S], len(d.cues)),
 	}
+}
+
+func (r *runner[I, S]) now() time.Time {
+	if r.deck.Now != nil {
+		return r.deck.Now()
+	}
+	return time.Now()
+}
+
+func (r *runner[I, S]) spawn(fn func()) {
+	if r.deck.Spawn != nil {
+		r.deck.Spawn(fn)
+		return
+	}
+	go fn()
 }
 
 func (r *runner[I, S]) run() (Result, error) {
@@ -350,12 +421,11 @@ func (r *runner[I, S]) trigger(cues []Cue[I, S]) {
 	for _, c := range cues {
 		r.activeCount++
 		// Snapshot input and state for concurrent execution
-		currentInput := r.input
-		currentState := *r.state
-		go func(cue Cue[I, S], input I, state S) {
-			startTime := time.Now()
+		cue, input, state := c, r.input, *r.state
+		r.spawn(func() {
+			startTime := r.now()
 			mutation, err := cue.Run(input, state)
-			endTime := time.Now()
+			endTime := r.now()
 			r.done <- cueResult[S]{
 				cueName:   cue.Name,
 				mutation:  mutation,
@@ -363,7 +433,7 @@ func (r *runner[I, S]) trigger(cues []Cue[I, S]) {
 				startTime: startTime,
 				endTime:   endTime,
 			}
-		}(c, currentInput, currentState)
+		})
 	}
 }
 
@@ -371,35 +441,69 @@ func (r *runner[I, S]) isStable() bool {
 	return r.activeCount == 0
 }
 
+// wait absorbs exactly one cue result, or returns an error if the run was
+// cancelled or stalled first. It takes the first of three paths that applies:
+// a result already buffered, a yield to the caller's scheduler, or a plain
+// blocking receive. Only that last path blocks, so a Deck configured with a
+// serial Spawn or an Await never performs a blocking operation at all.
 func (r *runner[I, S]) wait() error {
+	// A result already delivered wins over cancellation: with a serial Spawn
+	// every result is buffered before wait runs, and this keeps that path off
+	// the ctx branch entirely — deterministic where it matters.
+	select {
+	case result := <-r.done:
+		return r.absorb(result)
+	default:
+	}
+
+	// An engine's scheduler owns the thread: yield to it rather than block,
+	// then take the result without blocking. A scheduler that reports success
+	// with nothing ready is broken — say so, rather than park on a receive no
+	// context can reach.
+	if r.deck.Await != nil {
+		if err := r.deck.Await(func() bool { return len(r.done) > 0 }); err != nil {
+			return fmt.Errorf("deck run cancelled: %w", err)
+		}
+		select {
+		case result := <-r.done:
+			return r.absorb(result)
+		default:
+			return fmt.Errorf("deck run stalled: Await returned before a cue result was ready")
+		}
+	}
+
 	select {
 	case <-r.ctx.Done():
 		return fmt.Errorf("deck run cancelled: %w", r.ctx.Err())
 	case result := <-r.done:
-		r.activeCount--
-		// A cue's error takes precedence over its mutation: if Run returned
-		// an error, the cue is treated as failed — its mutation is discarded
-		// and it is not recorded in CompletedCues.
-		if result.err != nil {
-			if r.runErr == nil {
-				r.runErr = fmt.Errorf("cue %s: %w", result.cueName, result.err)
-			}
-			return nil
-		}
-		if result.mutation != nil {
-			result.mutation.apply(r.state)
-			if result.mutation.isSuspended() {
-				r.suspended = true
-			} else {
-				r.completed = append(r.completed, CompletedCue{
-					Name:      result.cueName,
-					StartTime: result.startTime,
-					EndTime:   result.endTime,
-				})
-			}
+		return r.absorb(result)
+	}
+}
+
+// absorb applies one finished cue's outcome. A cue's error takes precedence
+// over its mutation: if Run returned an error, the cue is treated as failed —
+// its mutation is discarded and it is not recorded in CompletedCues.
+func (r *runner[I, S]) absorb(result cueResult[S]) error {
+	r.activeCount--
+	if result.err != nil {
+		if r.runErr == nil {
+			r.runErr = fmt.Errorf("cue %s: %w", result.cueName, result.err)
 		}
 		return nil
 	}
+	if result.mutation != nil {
+		result.mutation.apply(r.state)
+		if result.mutation.isSuspended() {
+			r.suspended = true
+		} else {
+			r.completed = append(r.completed, CompletedCue{
+				Name:      result.cueName,
+				StartTime: result.startTime,
+				EndTime:   result.endTime,
+			})
+		}
+	}
+	return nil
 }
 
 // drain waits for all remaining active cues to complete.
