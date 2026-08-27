@@ -1863,8 +1863,8 @@ func TestDeck_Run_InjectedNow_StampsCompletedCueTimes(t *testing.T) {
 	sut, err := deck.New(cue)
 	require.NoError(t, err)
 	sut.Now = func() time.Time {
-		// Guarded because Now is called from inside each cue's execution:
-		// under the default Spawn a bare counter races once two cues overlap.
+		// Now runs inside each cue; a bare counter would race under the
+		// default Spawn.
 		mu.Lock()
 		defer mu.Unlock()
 		ticks++
@@ -1920,10 +1920,8 @@ func TestDeck_Run_SerialSpawn_RunsEachCueToCompletionBeforeTheNext(t *testing.T)
 }
 
 func TestDeck_Run_SerialSpawn_CompletesEvenWhenContextIsAlreadyCancelled(t *testing.T) {
-	// Given a serial Spawn, every cue's result is buffered before wait runs,
-	// so wait must never reach its context branch. A context cancelled before
-	// Run even starts makes that observable: if the ctx branch is reachable at
-	// all, one of these ten waits will take it.
+	// Given a serial Spawn, every result is buffered before Run checks for
+	// one, so a context cancelled before Run even starts must go unnoticed.
 	var cues []deck.Cue[struct{}, TestState]
 	for i := 0; i < 10; i++ {
 		cues = append(cues, deck.Cue[struct{}, TestState]{
@@ -1951,10 +1949,9 @@ func TestDeck_Run_SerialSpawn_CompletesEvenWhenContextIsAlreadyCancelled(t *test
 	assert.Equal(t, 10, state.Count)
 }
 
-// coopScheduler models a cooperative, single-threaded scheduler like
-// Temporal's deterministic runner: spawned work is queued rather than started,
-// only one piece of work runs at a time, and the queue only advances when the
-// waiting thread yields.
+// coopScheduler models a cooperative scheduler like Temporal's deterministic
+// runner: spawned work is queued rather than started, and the queue only
+// advances when the waiting thread yields.
 type coopScheduler struct {
 	queue []func()
 }
@@ -2076,9 +2073,8 @@ func TestDeck_Run_Cancellation_DoesNotLeakCueGoroutines(t *testing.T) {
 	assert.Zero(t, deckGoroutines(), "cue goroutines leaked after %d abandoned runs", runs)
 }
 
-// deckGoroutines counts goroutines parked inside deck's own cue plumbing.
-// Unlike runtime.NumGoroutine it ignores unrelated activity elsewhere in the
-// test binary, so the count means only what this file cares about.
+// deckGoroutines counts goroutines inside deck's runner, ignoring the
+// unrelated activity runtime.NumGoroutine would include.
 func deckGoroutines() int {
 	buf := make([]byte, 1<<20)
 	n := runtime.Stack(buf, true)
@@ -2298,10 +2294,9 @@ func TestDeck_Run_SerialSpawn_SuspendsExportsAndResumes(t *testing.T) {
 }
 
 func TestDeck_Run_SerialSpawn_DoesNotDeadlockWhenEveryCueTriggersAtOnce(t *testing.T) {
-	// Given many cues that all trigger in the same cycle. A serial Spawn
-	// delivers every result before anything starts receiving them, so the
-	// result buffer must hold the lot — otherwise Run deadlocks inside
-	// trigger, where no context can rescue it.
+	// Given many cues that all trigger in one cycle. A serial Spawn delivers
+	// every result before anything receives, so the buffer must hold them all
+	// or Run deadlocks before any context is consulted.
 	const cueCount = 25
 	var cues []deck.Cue[struct{}, TestState]
 	for i := 0; i < cueCount; i++ {
@@ -2331,8 +2326,8 @@ func TestDeck_Run_SerialSpawn_DoesNotDeadlockWhenEveryCueTriggersAtOnce(t *testi
 		done <- outcome{result: result, err: runErr}
 	}()
 
-	// Then it finishes rather than parking on a send nobody can receive. Any
-	// other failure is reported as itself, not misdiagnosed as a deadlock.
+	// Then it finishes; any other failure is reported as itself rather than
+	// as a deadlock.
 	select {
 	case got := <-done:
 		require.NoError(t, got.err)
@@ -2343,9 +2338,8 @@ func TestDeck_Run_SerialSpawn_DoesNotDeadlockWhenEveryCueTriggersAtOnce(t *testi
 }
 
 func TestDeck_Run_Await_ReturningWithoutAResultFailsRatherThanBlocking(t *testing.T) {
-	// Given a scheduler whose Await reports success without a result actually
-	// being ready — a broken adapter. Deck must surface that, not park on a
-	// receive no context can reach.
+	// Given a scheduler whose Await returns without a result being ready — a
+	// broken adapter
 	sched := &coopScheduler{}
 	cue := deck.Cue[struct{}, TestState]{
 		Name: "C",
