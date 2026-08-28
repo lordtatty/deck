@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"time"
 
 	"github.com/lordtatty/deck"
@@ -102,7 +103,14 @@ func runInTemporal(c client.Client, in flow.Input) flow.State {
 	return state
 }
 
+// main returns the exit code from run so that the deferred shutdowns there
+// still happen: os.Exit, which log.Fatal calls, would skip them and leave the
+// dev server running.
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	in := flow.Input{CustomerID: "cust-42"}
 
 	fmt.Println("The profile and orders lookups take 400ms each and do not")
@@ -134,11 +142,17 @@ func main() {
 	durable := runInTemporal(c, in)
 	fmt.Printf("Temporal   %-34s %v\n", durable.Report, time.Since(start).Round(10*time.Millisecond))
 
+	// The comparison is the point of the example, so disagreeing is a failure
+	// rather than a remark — that is what makes running this in CI worth
+	// anything.
 	fmt.Println()
-	if local.Report == durable.Report {
-		fmt.Println("Same cues, same answer, parallel in both — and the Temporal run")
-		fmt.Println("would survive the process being killed halfway through.")
+	if local.Report != durable.Report {
+		fmt.Fprintf(os.Stderr, "MISMATCH\n  plain Go: %s\n  Temporal: %s\n", local.Report, durable.Report)
+		return 1
 	}
+	fmt.Println("Same cues, same answer, parallel in both — and the Temporal run")
+	fmt.Println("would survive the process being killed halfway through.")
+	return 0
 }
 
 // devServer starts a throwaway Temporal server so this example runs with no

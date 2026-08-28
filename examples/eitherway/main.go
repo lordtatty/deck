@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -64,7 +65,13 @@ func mustExecute(mode string, in flow.Input) flow.State {
 	return state
 }
 
+// main returns the exit code from run so that run's deferred shutdowns still
+// happen: os.Exit would skip them and leave a dev server running.
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	mode := flag.String("mode", "inline", "inline, temporal, or both")
 	flag.Parse()
 
@@ -89,18 +96,19 @@ func main() {
 		inline := mustExecute("inline", in)
 		durable := mustExecute("temporal", in)
 
+		// Disagreeing is a failure, not a remark: this comparison is the point
+		// of the example, and what makes running it in CI worth anything.
 		fmt.Println()
-		if inline.Indexed == durable.Indexed {
-			fmt.Println("Identical results. The flow was compiled once and never")
-			fmt.Println("asked which world it was running in.")
-		} else {
-			fmt.Println("MISMATCH:")
-			fmt.Println("  inline:   " + inline.Indexed)
-			fmt.Println("  temporal: " + durable.Indexed)
+		if inline.Indexed != durable.Indexed {
+			fmt.Fprintf(os.Stderr, "MISMATCH\n  inline:   %s\n  temporal: %s\n", inline.Indexed, durable.Indexed)
+			return 1
 		}
+		fmt.Println("Identical results. The flow was compiled once and never")
+		fmt.Println("asked which world it was running in.")
 	default:
 		state := mustExecute(*mode, in)
 		fmt.Println()
 		fmt.Println("keywords: " + strings.Join(state.Keywords, ", "))
 	}
+	return 0
 }

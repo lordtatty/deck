@@ -23,3 +23,36 @@ jobs:
     - name: Test (temporal module)
       working-directory: temporal
       run: go test -race -v ./...
+
+  examples:
+    name: examples
+    runs-on: ubuntu-latest
+    # Each example runs to completion, so a hang is a failure rather than a
+    # six-hour job.
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dir: basic
+          - dir: concurrent
+          - dir: engines
+          - dir: portable
+          - dir: temporal
+          - dir: jobqueue
+          - dir: eitherway
+            # -mode both is the one that compares the two worlds and fails if
+            # they disagree.
+            args: -mode both
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: examples/${{ matrix.dir }}/go.mod
+
+      # The Temporal examples start their own dev server and jobqueue starts a
+      # Redis container, so there is nothing to set up here.
+      - name: go run ./examples/${{ matrix.dir }}
+        working-directory: examples/${{ matrix.dir }}
+        run: go run . ${{ matrix.args }}
