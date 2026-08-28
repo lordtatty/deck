@@ -2718,3 +2718,46 @@ func TestDeck_Run_Do_WorkErrorFailsTheCue(t *testing.T) {
 	assert.False(t, result.Completed("Failing"))
 	assert.Empty(t, state.Values)
 }
+
+// captureEngine records the Work it is handed, so a test can see what an
+// engine has to go on when it decides how to perform it.
+type captureEngine struct {
+	deck.Engine
+	works []deck.Work
+}
+
+func (e *captureEngine) Execute(ctx context.Context, w deck.Work) deck.Future {
+	e.works = append(e.works, w)
+	return e.Engine.Execute(ctx, w) //nolint:wrapcheck // delegating to the wrapped engine
+}
+
+func TestDeck_Run_Do_TellsTheEngineWhichCueDeclaredTheWork(t *testing.T) {
+	// Given cues that declare work, on an engine that inspects it
+	mkCue := func(name string) deck.Cue[struct{}, workState] {
+		return deck.Cue[struct{}, workState]{
+			Name: name,
+			Run: func(_ struct{}, _ workState) (deck.Mutation[workState], error) {
+				return deck.Do(slowValue, name, func(v string) deck.Mutation[workState] {
+					return deck.Complete(func(s *workState) { s.Values = append(s.Values, v) })
+				}), nil
+			},
+		}
+	}
+
+	engine := &captureEngine{Engine: deck.Serial()}
+	sut, err := deck.New(mkCue("alpha"), mkCue("beta"))
+	require.NoError(t, err)
+	sut.Engine = engine
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = runBounded(t, sut, ctx, struct{}{}, &workState{})
+	require.NoError(t, err)
+
+	// Then each unit of work names the cue that declared it, so an engine can
+	// treat one cue's work differently from another's
+	require.Len(t, engine.works, 2)
+	assert.Equal(t, "alpha", engine.works[0].CueName)
+	assert.Equal(t, "beta", engine.works[1].CueName)
+}

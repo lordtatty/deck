@@ -26,6 +26,15 @@
 //   - A cue's Run executes inline on the workflow coroutine, so it must not
 //     block. Declare work with deck.Do instead; a cue that blocks will trip
 //     Temporal's deadlock detector.
+//
+// Where one cue needs different activity settings from the rest, name it in the
+// wiring rather than in the flow:
+//
+//	d.Engine = temporal.New(ctx,
+//		temporal.ForCue("summarise", workflow.ActivityOptions{
+//			StartToCloseTimeout: 10 * time.Minute,
+//		}),
+//	)
 package temporal
 
 import (
@@ -40,12 +49,39 @@ import (
 // New returns an Engine that runs a Deck inside the workflow ctx belongs to.
 //
 // Activity settings come from ctx, so apply workflow.WithActivityOptions before
-// calling this — deck does not choose them for you.
-func New(ctx workflow.Context) deck.Engine {
-	return &engine{ctx: ctx}
+// calling this — deck does not choose them for you. Use ForCue where one cue
+// needs different settings from the rest.
+func New(ctx workflow.Context, opts ...Option) deck.Engine {
+	e := &engine{ctx: ctx}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
 
-type engine struct{ ctx workflow.Context }
+// Option configures the Engine returned by New.
+type Option func(*engine)
+
+// ForCue sets the activity options used for the work one cue declares, in place
+// of those on the workflow context.
+//
+// Activity options are Temporal's, so a cue that set its own would have to
+// import Temporal — and would stop running anywhere else. Naming the cue here
+// keeps the flow portable and puts the timeout where the deployment decisions
+// already live.
+func ForCue(name string, o workflow.ActivityOptions) Option {
+	return func(e *engine) {
+		if e.perCue == nil {
+			e.perCue = make(map[string]workflow.ActivityOptions)
+		}
+		e.perCue[name] = o
+	}
+}
+
+type engine struct {
+	ctx    workflow.Context
+	perCue map[string]workflow.ActivityOptions
+}
 
 // Now is the workflow's clock. It reports the time the current workflow task
 // started, so cues completing within one task can report a zero Duration.
@@ -63,9 +99,14 @@ func (e *engine) Spawn(fn func()) deck.Future {
 // so every cue triggered in a cycle has its activity in flight before the Deck
 // waits for any of them.
 func (e *engine) Execute(_ context.Context, w deck.Work) deck.Future {
+	ctx := e.ctx
+	// A map lookup, never a range: iteration order would not survive replay.
+	if o, ok := e.perCue[w.CueName]; ok {
+		ctx = workflow.WithActivityOptions(ctx, o)
+	}
 	return &future{
-		ctx:    e.ctx,
-		future: workflow.ExecuteActivity(e.ctx, w.Func, w.Arg),
+		ctx:    ctx,
+		future: workflow.ExecuteActivity(ctx, w.Func, w.Arg),
 		result: w.Result,
 	}
 }

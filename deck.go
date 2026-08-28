@@ -488,10 +488,12 @@ func (r *runner[I, S]) absorb(a *attempt[S]) {
 	if w, ok := a.mutation.(*workMutation[S]); ok {
 		// The cue declared work rather than a state change: start it and keep
 		// the cue in flight until its result arrives.
+		work := w.work
+		work.CueName = a.name
 		r.inflight = append(r.inflight, &attempt[S]{
 			name:    a.name,
 			start:   a.start,
-			future:  r.engine.Execute(r.ctx, w.work),
+			future:  r.engine.Execute(r.ctx, work),
 			collect: w.collect,
 		})
 		return

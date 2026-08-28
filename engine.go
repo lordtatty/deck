@@ -35,6 +35,12 @@ type Engine interface {
 // Work is a unit of work a cue declared with Do. Every field is here so that
 // an Engine can choose how to perform it, rather than deck deciding for it.
 type Work struct {
+	// CueName is the cue that declared this work. An Engine can use it to
+	// treat one cue's work differently from another's — a longer timeout, a
+	// different queue — without the cue itself knowing anything about the
+	// engine.
+	CueName string
+
 	// Func and Arg identify the work. An Engine that runs work elsewhere
 	// schedules it by these — Temporal, for one, resolves Func to the activity
 	// registered under its name.
