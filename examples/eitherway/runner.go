@@ -101,11 +101,13 @@ func NewTemporal() *Temporal {
 	w := worker.New(c, taskQueue, worker.Options{})
 	w.RegisterWorkflow(IndexWorkflow)
 
-	// The flow's own functions, registered exactly as written. There is no
-	// Temporal-specific copy of them anywhere.
+	// The flow's own functions, registered exactly as written — there is no
+	// Temporal-specific copy of them anywhere. Only the three the cues declared
+	// with Do appear here: keywords and index never leave the workflow, so
+	// there is nothing to register for them.
 	w.RegisterActivity(flow.Fetch)
 	w.RegisterActivity(flow.Summarise)
-	w.RegisterActivity(flow.Keywords)
+	w.RegisterActivity(flow.Classify)
 
 	if err := w.Start(); err != nil {
 		log.Fatalf("starting worker: %v", err)

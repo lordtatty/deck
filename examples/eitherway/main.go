@@ -56,9 +56,14 @@ func main() {
 
 	in := flow.Input{URL: "report.html"}
 
-	fmt.Println("fetch, then summarise and keywords together, then index.")
-	fmt.Println("300ms + 400ms of parallel work = about 700ms if the two middle")
-	fmt.Println("cues really do overlap; 1.1s if they do not.")
+	fmt.Println("fetch, then summarise / classify / keywords together, then index.")
+	fmt.Println()
+	fmt.Println("Five cues, but only three declare work with deck.Do — the other two")
+	fmt.Println("just read state, so they run inline and cost nothing. Under Temporal")
+	fmt.Println("that is three activities, not five.")
+	fmt.Println()
+	fmt.Println("300ms + 400ms of parallel work = about 700ms if summarise and classify")
+	fmt.Println("really do overlap; 1.1s if they do not.")
 	if *mode != "inline" {
 		fmt.Println("(starting a Temporal dev server — downloaded once, then cached)")
 	}
