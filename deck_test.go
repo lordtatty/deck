@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3103,12 +3104,11 @@ func TestDeck_Run_HandlesALargeFanOut(t *testing.T) {
 // going could take the nudge meant for another, and that other run would wait
 // for a wakeup already consumed.
 //
-// The shape matters for catching that reliably. A single-slot signal hands each
-// nudge to whichever run has been waiting longest, so the slow run starts first
-// and parks before any fast run exists: under a one-slot signal it then takes
-// the first fast completion's nudge, and the last fast run to finish is left
-// waiting for the slow run instead of returning at once. Three fast runs rather
-// than one leave no room for scheduling luck to hide it.
+// The shape matters for catching it reliably. A single-slot signal goes to
+// whichever run has waited longest — the slow one, parked first — so it
+// swallows every fast completion and is never woken by its own. That surfaces
+// as the slow run failing on its context deadline, which is what catches the
+// regression; the elapsed-time check below is the property being protected.
 //
 // Every other test builds an engine per run, which is why none of them caught
 // this.
@@ -3161,10 +3161,11 @@ func TestDeck_Run_OneEngineSharedBetweenConcurrentRuns(t *testing.T) {
 
 	// Then every run finishes on its own schedule, none waiting on another
 	for i, d := range durations {
-		require.NoErrorf(t, errs[i], "run %d (%v cue)", i, d)
+		//nolint:testifylint // the runs are independent; report every one
+		assert.NoErrorf(t, errs[i], "run %d (%v cue)", i, d)
 		t.Logf("run %d (%v cue) took %v", i, d, took[i].Round(10*time.Millisecond))
 		if d == fast {
-			assert.Lessf(t, took[i], slow, "run %d: a fast run waited for the slow one", i)
+			assert.Lessf(t, took[i], 3*fast, "run %d: a fast run waited on another run", i)
 		}
 	}
 }
@@ -3280,6 +3281,59 @@ func TestDeck_Run_SuspendStillCompletesASiblingsDeclaredWork(t *testing.T) {
 			mu.Unlock()
 			assert.True(t, result.Completed("worker"))
 			assert.Equal(t, []rune{'w'}, state.Buffer)
+		})
+	}
+}
+
+// Do's handler returns a Mutation, so it may return another Do — the natural
+// way to write "call again until it is ready". Left unchecked, each collected
+// result starts the next round and a suspending run never finishes draining.
+// What the cue's own Run declared still runs, so the snapshot stays whole.
+func TestDeck_Run_SuspendStopsWorkChainedFromAHandler(t *testing.T) {
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given a cue that keeps declaring more work from its own handler
+			var rounds atomic.Int64
+			work := func(_ context.Context, _ string) (string, error) {
+				rounds.Add(1)
+				return "v", nil
+			}
+			var chain func(string) deck.Mutation[TestState]
+			chain = func(string) deck.Mutation[TestState] {
+				if rounds.Load() >= 20 { // a cap, so a failure reports rather than hangs
+					return deck.Complete(func(s *TestState) { s.Count = -1 })
+				}
+				return deck.Do(work, "x", chain)
+			}
+
+			poller := deck.Cue[struct{}, TestState]{
+				Name: "poller",
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Do(work, "x", chain), nil
+				},
+			}
+			suspender := deck.Cue[struct{}, TestState]{
+				Name: "suspender",
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Suspended(func(s *TestState) { s.Count = 1 }), nil
+				},
+			}
+
+			sut, err := deck.New(suspender, poller)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			// When a sibling suspends the run
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			result, err := runBounded(t, sut, ctx, struct{}{}, &TestState{})
+
+			// Then the work its Run declared ran, and the chain stopped there
+			require.NoError(t, err)
+			assert.True(t, result.Suspended)
+			assert.Equal(t, int64(1), rounds.Load(),
+				"the handler's next round must not start once the run is suspending")
+			assert.False(t, result.Completed("poller"), "the cue did not finish")
 		})
 	}
 }

@@ -344,6 +344,10 @@ func (d *Deck[I, S]) Import(data []byte) (*S, Result, error) {
 // Cancellation is checked between cycles, and again whenever the Engine
 // yields. Only the default Engine can additionally abandon cues in flight.
 //
+// An error beats a suspension: a cue failing during the drain makes Run return
+// that error, with no suspension in the Result and state left as it was. Work
+// already begun still ran, so a resumed run may repeat it.
+//
 // Input is passed by value to every When and Run; the library does not
 // mutate it and cues must not. State is mutated by cues' returned Mutations
 // and updated in-place on successful return. On error (cue error or context
@@ -566,12 +570,13 @@ func (r *runner[I, S]) absorb(a *attempt[S]) {
 		return
 	}
 	if w, ok := a.mutation.(*workMutation[S]); ok {
-		// Starting the work is what causes the side effect, so a failing run
-		// does not start it: its results are about to be discarded anyway.
-		// A suspending run is different — its state is about to be exported,
-		// so the work runs and the cue is recorded, or the snapshot would be
-		// missing a result nothing could recover.
-		if r.runErr != nil {
+		// Starting the work is the side effect. A failing run starts none, its
+		// results being about to be discarded. A suspending run starts what the
+		// cue's own Run declared, so the snapshot it exports is whole — but not
+		// work chained from a handler, which could ask for another round
+		// forever.
+		chained := a.collect != nil
+		if r.runErr != nil || (r.suspended && chained) {
 			return
 		}
 		work := w.work

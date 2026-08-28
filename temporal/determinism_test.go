@@ -138,8 +138,9 @@ func historyOf(t *testing.T, c client.Client, workflowID, runID string) *history
 	return &hist
 }
 
-// scheduledActivities counts the activities a history records being started —
-// one per deck.Do that reached the engine.
+// scheduledActivities counts ActivityTaskScheduled events — one per deck.Do
+// that reached the engine. Scheduled, not started: one queued but never picked
+// up still counts.
 func scheduledActivities(hist *historypb.History) int {
 	n := 0
 	for _, e := range hist.Events {
