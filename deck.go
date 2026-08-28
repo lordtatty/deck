@@ -574,8 +574,14 @@ func (r *runner[I, S]) absorb(a *attempt[S]) {
 		return
 	}
 	if w, ok := a.mutation.(*workMutation[S]); ok {
-		// The cue declared work rather than a state change: start it and keep
-		// the cue in flight until its result arrives.
+		// The cue declared work rather than a state change. Starting it is what
+		// causes the side effect, so once the run has decided to stop, it is
+		// not started at all — draining is for letting work in flight finish,
+		// not for beginning more. The cue is left uncompleted, so a resumed run
+		// will trigger it again.
+		if r.runErr != nil || r.suspended {
+			return
+		}
 		work := w.work
 		work.CueName = a.name
 		r.inflight = append(r.inflight, &attempt[S]{

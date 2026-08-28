@@ -14,7 +14,10 @@ import (
 // inside a durable-execution engine's workflow, or in a test that needs a fixed
 // execution order.
 type Engine interface {
-	// Now stamps cue start and end times.
+	// Now stamps cue start and end times. It is called from inside each cue as
+	// well as from the run itself, so unless Spawn runs cues one at a time it
+	// must be safe for concurrent use — the obvious counter-based test clock
+	// races otherwise, and only -race will say so.
 	Now() time.Time
 
 	// Spawn runs fn exactly once, now or later, and returns a handle reporting
@@ -85,12 +88,15 @@ type Future interface {
 //
 // An Engine may be shared between concurrent runs.
 func Goroutines() Engine {
-	return &goEngine{wake: make(chan struct{}, 1)}
+	return &goEngine{wake: make(chan struct{})}
 }
 
 type goEngine struct {
-	// wake carries at most one pending nudge; Await re-checks ready on every
-	// wake, so a coalesced nudge cannot lose a completion.
+	mu sync.Mutex
+	// wake is closed to wake every waiting run at once, then replaced. A single
+	// nudge would be taken by whichever run got there first, leaving the run it
+	// was meant for waiting for a signal that had already been consumed — and
+	// an Engine may be shared between concurrent runs.
 	wake chan struct{}
 }
 
@@ -109,25 +115,41 @@ func (e *goEngine) start(fn func() error) Future {
 	go func() {
 		err := fn()
 		f.settle(err)
-		select {
-		case e.wake <- struct{}{}:
-		default:
-		}
+		e.notify()
 	}()
 	return f
 }
 
 func (e *goEngine) Await(ctx context.Context, fs []Future) error {
-	for !AnyReady(fs) {
+	for {
+		// Take the current channel before checking readiness. A cue finishing
+		// in between replaces the channel, so this one is already closed and
+		// the wait below returns at once — the wakeup cannot be missed.
+		wake := e.waiter()
+		if AnyReady(fs) {
+			return nil
+		}
 		select {
-		case <-e.wake:
+		case <-wake:
 		case <-ctx.Done():
 			// Passed through unwrapped: the Deck adds the run's own context
 			// when it reports this.
 			return ctx.Err() //nolint:wrapcheck
 		}
 	}
-	return nil
+}
+
+func (e *goEngine) waiter() <-chan struct{} {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.wake
+}
+
+func (e *goEngine) notify() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	close(e.wake)
+	e.wake = make(chan struct{})
 }
 
 // goFuture's mutex is what publishes the work's writes to the reader: settle
@@ -190,6 +212,9 @@ func (f ReadyFuture) Get() error    { return f.Err }
 
 // WithClock returns e with now in place of its clock, leaving the rest of the
 // engine alone. Use it to make timestamps predictable in tests.
+//
+// As for Engine.Now: unless the engine runs cues one at a time, now is called
+// concurrently and must be safe for it.
 func WithClock(e Engine, now func() time.Time) Engine {
 	return clockEngine{Engine: e, now: now}
 }

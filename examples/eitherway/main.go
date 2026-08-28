@@ -38,7 +38,10 @@ func newRunner(mode string) Runner {
 	}
 }
 
-func execute(mode string, in flow.Input) flow.State {
+// execute returns its error rather than calling log.Fatal, because Fatal skips
+// deferred calls — and one of them shuts down the Temporal dev server this
+// example started.
+func execute(mode string, in flow.Input) (flow.State, error) {
 	runner := newRunner(mode)
 	defer runner.Close()
 
@@ -48,10 +51,18 @@ func execute(mode string, in flow.Input) flow.State {
 	start := time.Now()
 	state, err := runner.Run(ctx, in)
 	if err != nil {
-		log.Fatalf("%s: %v", mode, err)
+		return state, fmt.Errorf("%s: %w", mode, err)
 	}
 
 	fmt.Printf("%-10s %-46s %v\n", mode, state.Indexed, time.Since(start).Round(10*time.Millisecond))
+	return state, nil
+}
+
+func mustExecute(mode string, in flow.Input) flow.State {
+	state, err := execute(mode, in)
+	if err != nil {
+		log.Fatal(err)
+	}
 	return state
 }
 
@@ -77,8 +88,8 @@ func main() {
 
 	switch *mode {
 	case "both":
-		inline := execute("inline", in)
-		durable := execute("temporal", in)
+		inline := mustExecute("inline", in)
+		durable := mustExecute("temporal", in)
 
 		fmt.Println()
 		if inline.Indexed == durable.Indexed {
@@ -90,7 +101,7 @@ func main() {
 			fmt.Println("  temporal: " + durable.Indexed)
 		}
 	default:
-		state := execute(*mode, in)
+		state := mustExecute(*mode, in)
 		fmt.Println()
 		fmt.Println("keywords: " + strings.Join(state.Keywords, ", "))
 	}

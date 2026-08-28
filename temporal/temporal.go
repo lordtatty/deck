@@ -24,6 +24,15 @@
 // callback-driven work, keep the cue a normal deck.Do and use a generous
 // activity timeout, Temporal's async activity completion, or a signal.
 //
+// One trade-off to be aware of. A panic in workflow code would normally fail
+// the workflow *task*, which Temporal retries indefinitely — so a panicking cue
+// would pause the workflow until a fixed build was deployed, and then carry on.
+// Deck instead recovers panics in cue code and reports them as that cue's
+// error, because under other engines a panic runs on a goroutine the caller
+// cannot reach and would end the process. The consequence here is that a
+// panicking cue fails the workflow execution rather than pausing it. Treat a
+// panic in a cue as the bug it is, rather than as a deployable-fix pause.
+//
 // Two things to know:
 //
 //   - Cancellation reaches the Deck through the workflow context this engine

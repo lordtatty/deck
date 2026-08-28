@@ -3099,3 +3099,111 @@ func TestDeck_Run_HandlesALargeFanOut(t *testing.T) {
 	t.Logf("%d cues in %v (%v per cue)", cueCount, elapsed.Round(time.Millisecond), elapsed/cueCount)
 	assert.Less(t, elapsed, 2*time.Second, "a thousand cues should not take seconds")
 }
+
+// Goroutines() documents that an Engine may be shared between concurrent runs,
+// so it has to actually be true. The engine wakes waiting runs when a cue
+// finishes; if it signalled only one of them, a run whose own cue is still
+// going would consume the nudge meant for another, and that other run would
+// wait for a wakeup that had already been taken.
+//
+// Two runs with very different cue durations make that visible: the bug shows
+// up as the fast run finishing in the slow run's time, and the slow run never
+// finishing at all.
+//
+// Note the engine is created once, outside the loop. Every other test builds
+// one per run, which is why none of them caught this.
+func TestDeck_Run_OneEngineSharedBetweenConcurrentRuns(t *testing.T) {
+	shared := deck.Goroutines()
+
+	newRun := func(d time.Duration) *deck.Deck[struct{}, TestState] {
+		cue := deck.Cue[struct{}, TestState]{
+			Name: "work",
+			Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+				time.Sleep(d)
+				return deck.Complete(func(s *TestState) { s.Count++ }), nil
+			},
+		}
+		sut, err := deck.New(cue)
+		require.NoError(t, err)
+		sut.Engine = shared
+		return sut
+	}
+
+	// When a fast run and a slow run go at once on that one engine
+	const fast, slow = 100 * time.Millisecond, 500 * time.Millisecond
+	var wg sync.WaitGroup
+	took := make([]time.Duration, 2)
+	errs := make([]error, 2)
+
+	for i, d := range []time.Duration{fast, slow} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			start := time.Now()
+			_, err := newRun(d).Run(ctx, struct{}{}, &TestState{})
+			took[i], errs[i] = time.Since(start), err
+		}()
+	}
+	wg.Wait()
+
+	// Then both finish on their own schedule, neither waiting on the other
+	require.NoError(t, errs[0])
+	require.NoError(t, errs[1])
+	t.Logf("fast run %v, slow run %v", took[0].Round(10*time.Millisecond), took[1].Round(10*time.Millisecond))
+	assert.Less(t, took[0], slow, "the fast run should not have waited for the slow one's cue")
+}
+
+// Draining is meant to let cues in flight finish, but a cue whose Run declared
+// work with Do has not started that work yet — the Engine starts it when the
+// Deck absorbs the cue. Absorbing during a drain therefore used to *begin* new
+// work after the run had already decided to fail: a fresh HTTP call locally, a
+// newly scheduled activity under a durable engine, both after the abort.
+//
+// Serial ordering makes it deterministic: "explode" is registered first, so its
+// error is absorbed before "worker" is reached in the drain.
+func TestDeck_Run_DoesNotStartDeclaredWorkAfterAnError(t *testing.T) {
+	// Given a cue that fails, and a sibling that declared work
+	boom := errors.New("boom")
+	var mu sync.Mutex
+	workRan := false
+	work := func(_ context.Context, _ string) (string, error) {
+		mu.Lock()
+		workRan = true
+		mu.Unlock()
+		return "done", nil
+	}
+
+	exploding := deck.Cue[struct{}, TestState]{
+		Name: "explode",
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return nil, boom
+		},
+	}
+	worker := deck.Cue[struct{}, TestState]{
+		Name: "worker",
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return deck.Do(work, "x", func(string) deck.Mutation[TestState] {
+				return deck.Complete(func(s *TestState) { s.Count++ })
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(exploding, worker)
+	require.NoError(t, err)
+	sut.Engine = deck.Serial()
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state := &TestState{}
+	_, err = runBounded(t, sut, ctx, struct{}{}, state)
+
+	// Then the run fails on the first cue, and the sibling's work never starts
+	require.ErrorIs(t, err, boom)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.False(t, workRan, "declared work must not start once the run is failing")
+}
