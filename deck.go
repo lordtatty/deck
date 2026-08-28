@@ -57,6 +57,11 @@
 // which is what lets the same cues run on goroutines in one process and as
 // durable activities in another.
 //
+// One consequence of not knowing: locally the argument is handed to fn
+// directly, while an engine running the work elsewhere has to serialise it.
+// Unexported fields survive the first and not the second, silently. Keep
+// anything crossing that line to exported fields.
+//
 // Most flows mix the two: cues that fetch or call something use Do, and a cue
 // that merely assembles what they gathered uses Complete.
 //

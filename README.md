@@ -296,6 +296,25 @@ func MyWorkflow(ctx workflow.Context, in Input) (State, error) {
 
 Work declared with `deck.Do` becomes a Temporal activity — register the same functions with your worker and Temporal resolves them by name. Cues still run in parallel: independent activities all go out before any of them is waited on.
 
+#### One way the two worlds are not identical
+
+The cues are the same, but the journey your data takes is not. Locally, `Do` calls your function directly — same process, same memory, nothing touched. Under a durable engine the work may run on another machine, so the argument and the result travel as JSON.
+
+That means ordinary Go encoding rules apply to anything crossing that line, and the quiet case is the one to watch:
+
+```go
+type Order struct {
+    ID     string   // exported  — survives
+    region string   // unexported — arrives empty, with no error anywhere
+}
+```
+
+Run locally, `region` is intact. Run on Temporal, it is `""`. Nothing fails: deck sees no error, and Temporal is doing exactly what `encoding/json` is meant to do. Your tests pass and production is quietly wrong.
+
+Use exported fields for anything passed to `Do` or returned from it, and no functions or channels. Nothing about this is specific to deck — writing the activity by hand behaves the same way — but deck makes the boundary invisible, so it is worth knowing where it is.
+
+If you genuinely need something across that boundary which JSON cannot carry, Temporal's [`DataConverter`](https://pkg.go.dev/go.temporal.io/sdk/client#Options) is the supported hook: set it on the client once and it applies to everything the application sends. Deck deliberately does not encode arguments itself — doing so would make the workflow history opaque in the UI, and would sit underneath the very thing designed for this.
+
 Build the Deck once and give each workflow its own engine with `WithEngine` — a worker runs many workflows at a time, and assigning to `d.Engine` would have them all writing the same field:
 
 ```go
