@@ -7,9 +7,11 @@ A streamlined Go package for orchestrating concurrent, state-driven agent execut
 ## Key Concepts
 
 *   **Input vs State**: Each run has an immutable input `I` (read-only data that defines the run — a user message, request parameters) and a mutable state `S` (progress built up by cues). Input is passed by value to every cue and is never persisted. State is mutated via `Mutation`s and persisted by `Export`/`Import`.
-*   **Stateless Deck**: The `Deck` struct is immutable and stateless. Input and state are passed to `Run()`.
+*   **Stateless Deck**: A `Deck` holds no run state — input and state are passed to `Run()`, and a run never writes back to the Deck. The one field you may set is `Engine`.
 *   **Isolated Execution**: `Run()` operates on a copy of the state. External modifications during execution are ignored. On success, the final state is copied back.
 *   **Concurrent Cues**: Triggered cues run concurrently. State updates are serialised via mutation functions.
+*   **Engine**: Where cues run. Leave it nil for goroutines and the wall clock, or set it to run one at a time for a reproducible test — or inside a Temporal workflow, where the flow becomes durable.
+*   **Declared Work**: A cue can perform its work itself, or describe it with `deck.Do` and let the Engine perform it. Describing it is what lets one set of cues run both locally and durably.
 *   **Result History**: `Run()` returns a `Result` struct containing execution history, which cues can inspect.
 *   **Suspend/Resume**: Cues can signal suspension for long-running async work. The Deck stops cleanly and can be resumed later.
 *   **Export/Import**: Serialise state and result to bytes with `Export()` and restore with `Import()`. Input is **not** in the snapshot — the caller provides it fresh on resume.
@@ -201,6 +203,81 @@ state := &DashboardState{}
 result, err := d.Run(ctx, input, state)
 ```
 
+### Where Cues Run — the Engine
+
+By default a Deck runs each cue on its own goroutine and reads the wall clock. `Engine` changes that without touching a single cue:
+
+```go
+d, _ := deck.New(cues...)
+
+d.Engine = nil            // the default: a goroutine per cue, wall clock
+d.Engine = deck.Serial()  // one at a time, in registration order — reproducible
+```
+
+`deck.Serial()` is what you want in a test that asserts on ordering: it runs each cue inline to completion, so the same run happens the same way every time. `deck.WithClock(engine, now)` layers a fixed clock onto any engine so `CompletedCue` timestamps are predictable too.
+
+Anything satisfying the `Engine` interface will do — `Now`, `Spawn`, `Execute`, `Await` — so you can supply your own.
+
+### Declaring Work Instead of Doing It
+
+A cue that *does* its work is tied to the process it runs in. A cue that *declares* it can run anywhere:
+
+```go
+// An ordinary Go function. It is also exactly the shape of a Temporal activity.
+func FetchUser(ctx context.Context, id string) (User, error) { ... }
+
+Run: func(in Input, s State) (deck.Mutation[State], error) {
+    return deck.Do(FetchUser, in.UserID, func(u User) deck.Mutation[State] {
+        return deck.Complete(func(s *State) { s.User = u })
+    }), nil
+},
+```
+
+`deck.Do` returns immediately — it hands the work to the Engine and lets the Deck carry on triggering other cues. That is where the parallelism comes from, and it is why the same cue works whether the Engine runs the function on a goroutine or dispatches it to a worker on another machine.
+
+Use `deck.Complete` as before for a cue that only reads state and needs no work of its own.
+
+### Running Durably with Temporal
+
+`deck/temporal` is a separate module, so `go get` on the core pulls no Temporal dependency. Attaching it is one visible line:
+
+```go
+func MyWorkflow(ctx workflow.Context, in Input) (State, error) {
+    // Activity settings are yours to choose; deck will not invent them.
+    ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+        StartToCloseTimeout: time.Minute,
+    })
+
+    d, err := deck.New(cues...)
+    if err != nil {
+        return State{}, err
+    }
+    d.Engine = decktemporal.New(ctx)
+
+    var state State
+    _, err = d.Run(context.Background(), in, &state)
+    return state, err
+}
+```
+
+Work declared with `deck.Do` becomes a Temporal activity — register the same functions with your worker and Temporal resolves them by name. Cues still run in parallel: independent activities all go out before any of them is waited on.
+
+Where one cue needs different activity settings from the rest, name it in the wiring rather than in the flow:
+
+```go
+d.Engine = decktemporal.New(ctx,
+    decktemporal.ForCue("ship", workflow.ActivityOptions{
+        StartToCloseTimeout: 10 * time.Minute,
+    }),
+)
+```
+
+Three things worth knowing:
+
+- **Cancellation** reaches the Deck through the Engine's workflow context, not through the context passed to `Run`. Pass `context.Background()` there.
+- **A cue's `Run` executes inline** on the workflow coroutine, so it must not block. Declare work with `deck.Do`; a cue that blocks will trip Temporal's deadlock detector.
+- **`CompletedCue` timestamps** come from `workflow.Now`, which reports when the current workflow task started. A cue that starts and finishes inside one task reports a zero `Duration`.
+
 ### Suspend and Resume for Long-Running Jobs
 
 When a cue kicks off work that may take a long time (e.g. an API batch job), it returns `deck.Suspended()` instead of `deck.Complete()`. This:
@@ -384,14 +461,20 @@ If both webhooks arrive simultaneously, one worker gets the lock and processes. 
 
 The `examples/` directory contains complete, runnable examples. Each demonstrates the I/S split:
 
-| Example | Input | What it shows |
-|---|---|---|
-| `examples/basic` | `PipelineInput{Source}` | Three-stage pipeline: Prepare → Process → Summarise |
-| `examples/concurrent` | `DashboardInput{ReportTitle}` | Three parallel data fetches + report generation |
-| `examples/jobqueue` | `JobInput{JobID, Topic, Style}` | Testcontainers Redis job queue with stateless workers, webhooks, and two concurrent suspending cues — input lives at `jobs:<id>:input`, snapshots at `jobs:<id>:snapshot` |
+| Example | What it shows |
+|---|---|
+| `examples/basic` | Three-stage pipeline: Prepare → Process → Summarise |
+| `examples/concurrent` | Three parallel data fetches + report generation |
+| `examples/engines` | One set of cues under two Engines, side by side: concurrent and shortest-first, versus inline and reproducible. No dependencies. |
+| `examples/eitherway` | One flow behind a `Runner` interface, run inline or on Temporal by a flag — the shape a real service would take |
+| `examples/temporal` | Order fulfilment on Temporal: a payment that fails twice and is retried with no retry code in the flow, plus `ForCue` for a slow step |
+| `examples/portable` | The same cues run locally and on Temporal, side by side, reaching the same answer |
+| `examples/jobqueue` | Testcontainers Redis job queue with stateless workers, webhooks, and two concurrent suspending cues |
 
-The jobqueue example has its own `go.mod` to keep heavy dependencies out of the root module. Run it with:
+Each example is its own module, keeping heavy dependencies out of the root. Run any of them with:
 
 ```sh
-cd examples/jobqueue && go run .
+cd examples/engines && go run .
 ```
+
+The Temporal examples start a throwaway dev server themselves, so there is nothing to install first.

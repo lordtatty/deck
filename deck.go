@@ -32,6 +32,30 @@
 // Do not put functions, clients, or other behavior in I. Inject those via
 // closures over Cue.Run.
 //
+// # Where cues run
+//
+// A Deck's Engine decides where its cues run. Leave Deck.Engine nil and you
+// get Goroutines: one goroutine per cue and the wall clock. Set it to Serial
+// to run cues one at a time in registration order, which makes a run
+// reproducible, or to an engine of your own — see the deck/temporal module,
+// which runs a Deck inside a Temporal workflow.
+//
+// # Declaring work
+//
+// A Cue's Run may do its work directly and return Complete. It may instead
+// describe the work with Do and let the Engine perform it:
+//
+//	Run: func(in Input, s State) (deck.Mutation[State], error) {
+//		return deck.Do(FetchUser, in.UserID, func(u User) deck.Mutation[State] {
+//			return deck.Complete(func(s *State) { s.User = u })
+//		}), nil
+//	}
+//
+// Do returns straight away, so the Deck carries on triggering other cues while
+// the work runs. A cue written this way does not know where its work happens,
+// which is what lets the same cues run on goroutines in one process and as
+// durable activities in another.
+//
 // # Suspend and resume
 //
 // A Cue can return Suspended instead of Complete to signal that it has
