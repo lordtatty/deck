@@ -37,6 +37,13 @@ func ReportWorkflow(ctx workflow.Context, in flow.In) (flow.State, error) {
 	return state, nil
 }
 
+// The test the whole design was built against, written before any of it
+// existed. If one set of cues cannot run unchanged in both worlds then the
+// Engine abstraction has not earned its place, so this is the one to look at
+// first — and the one to be most suspicious of if it ever needs loosening.
+//
+// It asserts on overlap rather than only on the result, because a Deck that ran
+// the two lookups one after the other would reach exactly the same answer.
 func TestFlowRunsTheSameLocallyAndInTemporal(t *testing.T) {
 	in := flow.In{UserID: "u1"}
 

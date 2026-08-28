@@ -16,6 +16,18 @@ import (
 	"go.temporal.io/sdk/workflow"
 )
 
+// flowDeck is built once, at startup, and shared by every run. Cues are
+// read-only after New, so this is safe — but the Engine differs per run, which
+// is what WithEngine is for. Assigning to flowDeck.Engine instead would race
+// between concurrent runs.
+var flowDeck = func() *deck.Deck[flow.Input, flow.State] {
+	d, err := deck.New(flow.Cues()...)
+	if err != nil {
+		log.Fatalf("building deck: %v", err)
+	}
+	return d
+}()
+
 // Runner runs the flow. Which implementation you get is a startup decision;
 // everything after that point is written against this interface and does not
 // care.
@@ -33,14 +45,9 @@ type Inline struct{}
 func (Inline) Close() {}
 
 func (Inline) Run(ctx context.Context, in flow.Input) (flow.State, error) {
-	d, err := deck.New(flow.Cues()...)
-	if err != nil {
-		return flow.State{}, fmt.Errorf("building deck: %w", err)
-	}
 	// No Engine, so the default: a goroutine per cue and the wall clock.
-
 	var state flow.State
-	if _, err := d.Run(ctx, in, &state); err != nil {
+	if _, err := flowDeck.Run(ctx, in, &state); err != nil {
 		return state, fmt.Errorf("running flow: %w", err)
 	}
 	return state, nil
@@ -59,11 +66,9 @@ func IndexWorkflow(ctx workflow.Context, in flow.Input) (flow.State, error) {
 		StartToCloseTimeout: time.Minute,
 	})
 
-	d, err := deck.New(flow.Cues()...)
-	if err != nil {
-		return flow.State{}, fmt.Errorf("building deck: %w", err)
-	}
-	d.Engine = decktemporal.New(ctx)
+	// WithEngine, not flowDeck.Engine = ...: a worker runs many workflows at
+	// once, and they would all be writing the same field.
+	d := flowDeck.WithEngine(decktemporal.New(ctx))
 
 	// Cancellation arrives through the Engine's workflow context, so the
 	// context here is only a placeholder.

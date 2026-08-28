@@ -90,6 +90,10 @@ func runOptions(t *testing.T, perCue bool) ([]string, error) {
 	return out, nil
 }
 
+// This pair is a before-and-after on one unchanged flow, and the failing half
+// is as important as the passing one: it establishes that the shared timeout
+// really is too short, so the test below is demonstrating ForCue working rather
+// than a timeout that was never going to fire.
 func TestOneSetOfOptionsCannotServeEveryCue(t *testing.T) {
 	// Given a 300ms timeout shared by every cue, when one cue's work takes 700ms
 	_, err := runOptions(t, false)

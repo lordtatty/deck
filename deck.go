@@ -88,9 +88,34 @@ import (
 type Deck[I, S any] struct {
 	cues []Cue[I, S]
 
-	// Engine is where this Deck's cues run. Nil means Goroutines. Set it
-	// before calling Run; each run takes its own copy as it starts.
+	// Engine is where this Deck's cues run. Nil means Goroutines.
+	//
+	// Assign it only on a Deck you own outright. Where one Deck is shared
+	// between runs that need different engines — a package-level Deck used by
+	// every workflow on a worker, say — use WithEngine instead: assigning here
+	// would race with every other run in flight.
 	Engine Engine
+}
+
+// WithEngine returns a copy of d that runs on e, leaving d untouched. The two
+// share their cues, which are read-only once New has returned.
+//
+// It exists so that a Deck built once can serve many runs at once, each with
+// its own engine:
+//
+//	var flow, _ = deck.New(cues...)
+//
+//	func MyWorkflow(ctx workflow.Context) error {
+//		d := flow.WithEngine(temporal.New(ctx))
+//		...
+//	}
+//
+// Assigning to flow.Engine there would look equivalent and would race with
+// every other workflow the worker is running.
+func (d *Deck[I, S]) WithEngine(e Engine) *Deck[I, S] {
+	c := *d
+	c.Engine = e
+	return &c
 }
 
 // Cue is a single unit of work. The Deck evaluates each pending cue's When

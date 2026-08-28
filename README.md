@@ -284,6 +284,17 @@ func MyWorkflow(ctx workflow.Context, in Input) (State, error) {
 
 Work declared with `deck.Do` becomes a Temporal activity — register the same functions with your worker and Temporal resolves them by name. Cues still run in parallel: independent activities all go out before any of them is waited on.
 
+Build the Deck once and give each workflow its own engine with `WithEngine` — a worker runs many workflows at a time, and assigning to `d.Engine` would have them all writing the same field:
+
+```go
+var flow, _ = deck.New(cues...)   // once, at startup
+
+func MyWorkflow(ctx workflow.Context, in Input) (State, error) {
+    d := flow.WithEngine(decktemporal.New(ctx))
+    ...
+}
+```
+
 Where one cue needs different activity settings from the rest, name it in the wiring rather than in the flow:
 
 ```go

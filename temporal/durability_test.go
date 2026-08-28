@@ -172,6 +172,15 @@ func startedAfter(st durState, cut time.Time) []string {
 	return late
 }
 
+// The promise that justifies the whole exercise: kill the process running a
+// flow and the flow carries on somewhere else. worker-2 shares no memory with
+// worker-1, so everything it knows about which cues have finished it rebuilt
+// from history alone.
+//
+// The assertion to keep is the last one. Checking only that the flow completed
+// would pass even if worker-1 had quietly finished everything before stopping;
+// asserting that steps *began* after it was gone is what proves the
+// replacement did real work.
 func TestChainedFlowSurvivesAWorkerRestart(t *testing.T) {
 	// Given a chain of four cues, when the worker is replaced part way through
 	out, stopped := runAcrossAWorkerRestart(t, DurableChainWorkflow, "chain")
@@ -185,6 +194,10 @@ func TestChainedFlowSurvivesAWorkerRestart(t *testing.T) {
 	assert.NotEmpty(t, late, "no step ran after the restart, so nothing was proven")
 }
 
+// The harder version of the above. A chain only ever has one cue in flight, so
+// it says little about rebuilding state. This one restarts mid-join, so the
+// replacement has to reconstruct the whole first wave's completions before it
+// can decide anything — and then start fresh parallel work of its own.
 func TestParallelFlowSurvivesAWorkerRestart(t *testing.T) {
 	// Given four cues in flight at once and a join behind them, when the worker
 	// is replaced part way through

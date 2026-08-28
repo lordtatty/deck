@@ -81,6 +81,12 @@ func ParallelWorkflow(ctx workflow.Context) (parState, error) {
 	return s, nil
 }
 
+// Parallelism, shown rather than asserted: the logged timeline is the point of
+// this test as much as the elapsed-time bound. It separates the two things that
+// are easy to confuse — the Deck decides one cue at a time (all four Runs land
+// at 0ms), while the work itself goes out together (all four activities start
+// at once and finish together). Sequential execution would take four times as
+// long and read completely differently.
 func TestFourCuesRunTheirWorkInParallel(t *testing.T) {
 	trace = &Trace{t0: time.Now()}
 

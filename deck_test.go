@@ -1960,6 +1960,12 @@ func runBounded[I, S any](t *testing.T, d *deck.Deck[I, S], ctx context.Context,
 	}
 }
 
+// The next two run under every execution mode on purpose. Each mode reaches
+// cancellation by a different route, and two of them once ignored it entirely:
+// a serial Engine finishes its work before anything checks ctx, and an awaiting
+// Engine hands waiting to the caller's scheduler. Cancellation is now checked
+// between cycles precisely so all three behave alike, and running the same
+// assertions across the table is what keeps that true.
 func TestDeck_Run_AlreadyCancelledContext_TriggersNothing(t *testing.T) {
 	marker := t.Name()
 	for _, mode := range executionModes() {
@@ -1999,6 +2005,11 @@ func TestDeck_Run_AlreadyCancelledContext_TriggersNothing(t *testing.T) {
 	}
 }
 
+// The harder half of the pair: cancelled mid-flight rather than up front. This
+// is the case that regressed once — a result already waiting used to beat
+// ctx.Done(), so a chain of cues kept triggering new work under a dead context
+// and ran to completion. Counting how often the second cue starts is what
+// catches that; a returned error alone would not.
 func TestDeck_Run_CancelledFromInsideACue_TriggersNoFurtherCues(t *testing.T) {
 	marker := t.Name()
 	for _, mode := range executionModes() {
@@ -2105,6 +2116,10 @@ type coopFuture struct {
 func (f *coopFuture) IsReady() bool { return f.ready }
 func (f *coopFuture) Get() error    { return f.err }
 
+// The shape that makes parallelism possible: the Deck must hand every triggered
+// cue to the Engine before waiting on any of them. Assert on the interleaving,
+// not just the results — a Deck that spawned and waited, spawned and waited,
+// would produce the same final state while running everything in series.
 func TestDeck_Run_Await_HandsEveryCueToTheSchedulerBeforeAnyRuns(t *testing.T) {
 	// Given a scheduler that defers spawned work rather than running it
 	sched := newCoopEngine()
@@ -2169,6 +2184,11 @@ func TestDeck_Run_Await_SchedulerCancellationSurfacesAsError(t *testing.T) {
 	assert.Len(t, sched.queue, 1)
 }
 
+// Abandoned cues used to leak. Run would return on cancellation without
+// draining, and every cue still in flight parked forever trying to hand back a
+// result nobody was left to receive — one stuck goroutine per abandoned cue,
+// for the life of the process. Nothing about a leak shows up in a normal test,
+// so it needs counting directly.
 func TestDeck_Run_Cancellation_DoesNotLeakCueGoroutines(t *testing.T) {
 	// Given cues that block until released, each abandoned by a cancelled run
 	const runs = 20
@@ -2434,6 +2454,11 @@ func TestDeck_Run_SerialSpawn_SuspendsExportsAndResumes(t *testing.T) {
 	assert.Equal(t, 2, resumedState.Count)
 }
 
+// Guards the one failure the Deck cannot rescue itself from. Under a serial
+// Engine every cue completes before anything collects the results, so if the
+// Engine could not hold them all the run would wedge inside trigger — before
+// any context is consulted. Hence runBounded: five seconds and a clear message,
+// rather than the package timing out after ten minutes with a goroutine dump.
 func TestDeck_Run_SerialSpawn_DoesNotDeadlockWhenEveryCueTriggersAtOnce(t *testing.T) {
 	// Given many cues that all trigger in one cycle. A serial Spawn delivers
 	// every result before anything receives, so the buffer must hold them all
@@ -2463,6 +2488,11 @@ func TestDeck_Run_SerialSpawn_DoesNotDeadlockWhenEveryCueTriggersAtOnce(t *testi
 	assert.Len(t, result.CompletedCues, cueCount)
 }
 
+// An Engine that reports success with nothing ready is broken, but the failure
+// mode matters more than the cause: the Deck would park on a receive that no
+// context can reach, and inside a workflow engine that is a permanently stuck
+// run with nothing in the logs to explain it. A named error costs one line and
+// turns that into something diagnosable.
 func TestDeck_Run_Await_ReturningWithoutAResultFailsRatherThanBlocking(t *testing.T) {
 	// Given a scheduler whose Await returns without a result being ready — a
 	// broken adapter
@@ -2489,7 +2519,15 @@ func TestDeck_Run_Await_ReturningWithoutAResultFailsRatherThanBlocking(t *testin
 	assert.Contains(t, err.Error(), "stalled")
 }
 
-func TestDeck_Run_HooksMayBeReassignedAfterAnAbandonedRun(t *testing.T) {
+// A cancelled run returns while its cues are still executing. Those cues keep
+// reading whatever the Engine gave them — the clock, in this case — so if the
+// runner read Deck.Engine live, a caller setting up their next run would race
+// with a cue from the last one. The runner takes its own copy of the Engine at
+// the start of each run, which is what makes the reassignment below safe.
+//
+// Only -race can fail this: without it the reassignment and the read simply
+// interleave harmlessly. CI runs -race.
+func TestDeck_Run_EngineMayBeReassignedWhileAnAbandonedCueStillRuns(t *testing.T) {
 	// Given a cue still running after its run was cancelled
 	started := make(chan struct{})
 	cue := deck.Cue[struct{}, TestState]{
@@ -2731,6 +2769,10 @@ func (e *captureEngine) Execute(ctx context.Context, w deck.Work) deck.Future {
 	return e.Engine.Execute(ctx, w) //nolint:wrapcheck // delegating to the wrapped engine
 }
 
+// CueName is what lets an Engine treat one cue's work differently from
+// another's without the cue knowing anything about the Engine — it is what
+// decktemporal.ForCue is built on. Cheap to break by accident when the runner
+// changes, and nothing else in the core would notice.
 func TestDeck_Run_Do_TellsTheEngineWhichCueDeclaredTheWork(t *testing.T) {
 	// Given cues that declare work, on an engine that inspects it
 	mkCue := func(name string) deck.Cue[struct{}, workState] {
@@ -2833,4 +2875,71 @@ func TestDeck_Run_EngineThatCanOnlyWaitOnHandles(t *testing.T) {
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"value:a", "value:b", "value:c"}, state.Values)
 	assert.Len(t, result.CompletedCues, 3)
+}
+
+// This guards the mistake a Temporal user is most likely to make. The natural
+// way to write a workflow is to build the Deck once, at package level, and give
+// each workflow its own Engine:
+//
+//	var flowDeck, _ = deck.New(cues...)
+//
+//	func MyWorkflow(ctx workflow.Context) error {
+//		flowDeck.Engine = temporal.New(ctx)   // <-- data race
+//		...
+//	}
+//
+// That assignment looks harmless and is not: one worker runs many workflows at
+// a time, so every one of them writes that single field while the others are
+// reading it. WithEngine exists so the obvious spelling is also the safe one,
+// and this test is the reason it cannot quietly go back to assigning in place.
+//
+// It fails in two independent ways if WithEngine ever stops copying, which is
+// deliberate:
+//
+//   - under -race, the detector fires on the concurrent writes (CI runs -race)
+//   - without -race, the final assertion still catches it, because a
+//     non-copying WithEngine leaves its last Engine behind on the shared Deck
+func TestDeck_WithEngine_LetsOneDeckServeConcurrentRuns(t *testing.T) {
+	// Given one Deck built once and shared, as a package-level Deck would be
+	var cues []deck.Cue[struct{}, TestState]
+	for i := range 4 {
+		cues = append(cues, deck.Cue[struct{}, TestState]{
+			Name: string(rune('a' + i)),
+			Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+				return deck.Complete(func(s *TestState) { s.Count++ }), nil
+			},
+		})
+	}
+	sut, err := deck.New(cues...)
+	require.NoError(t, err)
+
+	// When many runs go at once, each choosing its own engine. They alternate
+	// between two engines on purpose: if every run wrote the same value, an
+	// in-place assignment could look correct by luck.
+	var wg sync.WaitGroup
+	for i := range 8 {
+		engine := deck.Goroutines()
+		if i%2 == 0 {
+			engine = deck.Serial()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			// Each run gets its own Deck, so there is nothing shared to write
+			// to. Every run must still see all four cues complete — proof that
+			// the copy kept the cues and only swapped the engine.
+			state := &TestState{}
+			_, runErr := sut.WithEngine(engine).Run(ctx, struct{}{}, state)
+			assert.NoError(t, runErr)
+			assert.Equal(t, 4, state.Count)
+		}()
+	}
+	wg.Wait()
+
+	// Then the shared Deck is exactly as New left it. Nothing wrote to it, so
+	// there was nothing to race on.
+	assert.Nil(t, sut.Engine, "WithEngine must copy the Deck, not modify it")
 }
