@@ -3,7 +3,7 @@ module github.com/lordtatty/deck/examples/eitherway
 go 1.25.4
 
 require (
-	github.com/lordtatty/deck v0.0.0
+	github.com/lordtatty/deck v0.1.0
 	github.com/lordtatty/deck/temporal v0.0.0
 	go.temporal.io/sdk v1.48.0
 )
