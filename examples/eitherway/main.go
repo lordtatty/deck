@@ -8,6 +8,11 @@
 // Runner chosen in main, which is the shape a real service would take: inline
 // for tests and local development, Temporal in production, decided by config
 // rather than by editing the flow.
+//
+// If you only want to see that the two worlds agree, examples/portable shows
+// that with no interface in the way. For what Temporal gives you beyond running
+// the flow at all — retries, per-cue timeouts, a readable history — see
+// examples/temporal.
 package main
 
 import (

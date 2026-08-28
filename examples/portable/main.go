@@ -5,6 +5,12 @@
 // The cues are in ./flow and are identical in both runs. Only the Engine
 // changes.
 //
+// This is the simplest demonstration that the two worlds agree, with no
+// indirection in the way. For the same idea arranged the way a service would
+// really be built — a Runner interface, and the choice made once at startup —
+// see examples/eitherway. For what Temporal gives you beyond running the flow
+// at all, see examples/temporal.
+//
 //	go run .
 //
 // The first run downloads a Temporal dev server (a one-off, cached by the SDK).

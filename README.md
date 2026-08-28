@@ -481,17 +481,26 @@ If both webhooks arrive simultaneously, one worker gets the lock and processes. 
 
 ## Runnable Examples
 
-The `examples/` directory contains complete, runnable examples. Each demonstrates the I/S split:
+The [`examples/`](examples) directory contains complete, runnable examples, each with its own module. [`examples/README.md`](examples/README.md) indexes them.
+
+**Plain deck**, no extra dependencies:
 
 | Example | What it shows |
 |---|---|
 | `examples/basic` | Three-stage pipeline: Prepare → Process → Summarise |
 | `examples/concurrent` | Three parallel data fetches + report generation |
-| `examples/engines` | One set of cues under two Engines, side by side: concurrent and shortest-first, versus inline and reproducible. No dependencies. |
-| `examples/eitherway` | One flow behind a `Runner` interface, run inline or on Temporal by a flag — the shape a real service would take |
-| `examples/temporal` | Order fulfilment on Temporal: a payment that fails twice and is retried with no retry code in the flow, plus `ForCue` for a slow step |
-| `examples/portable` | The same cues run locally and on Temporal, side by side, reaching the same answer |
+| `examples/engines` | One set of cues under two Engines, side by side: concurrent and shortest-first, versus inline and reproducible. Also where to reach for `Do` and where for `Complete`. |
 | `examples/jobqueue` | Testcontainers Redis job queue with stateless workers, webhooks, and two concurrent suspending cues |
+
+**With Temporal.** Three examples, because they answer three different questions — pick the one matching what you are trying to work out:
+
+| Example | The question it answers |
+|---|---|
+| `examples/portable` | *"Will my cues really run unchanged in both worlds?"* The same flow run locally and then on Temporal, back to back, reaching the same answer. The simplest possible demonstration — no indirection to read past. |
+| `examples/eitherway` | *"How do I build one service that can do either?"* The same idea as `portable`, but arranged the way you would actually ship it: a `Runner` interface, and the choice made once at startup from a flag. |
+| `examples/temporal` | *"What does Temporal actually give me?"* Order fulfilment on Temporal alone: a payment that fails twice and is retried with no retry code in the flow, per-cue timeouts via `ForCue`, and a Web UI to read the history. |
+
+Read them in that order if you are new to the pairing: `portable` shows it works, `eitherway` shows how to arrange it, `temporal` shows what you gain by it.
 
 Each example is its own module, keeping heavy dependencies out of the root. Run any of them with:
 

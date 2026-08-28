@@ -2,6 +2,10 @@
 // automatic retries of flaky work, different timeouts per unit of work, and a
 // full history you can open in a browser afterwards.
 //
+// This one is Temporal on its own terms. If you are instead asking whether the
+// same cues run unchanged with and without it, see examples/portable, or
+// examples/eitherway for that choice made at startup in a real service.
+//
 //	go run .            run the flow and exit
 //	go run . -ui        run it, then leave the Web UI up so you can read the history
 //
