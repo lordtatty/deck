@@ -27,9 +27,24 @@ type Engine interface {
 	// Spawn, the work may run elsewhere entirely.
 	Execute(ctx context.Context, w Work) Future
 
-	// Await yields until ready reports true. Returning an error stops the run:
-	// a cancelled context, or the engine's own cancellation.
-	Await(ctx context.Context, ready func() bool) error
+	// Await yields until at least one of fs is ready. Returning an error stops
+	// the run: a cancelled context, or the engine's own cancellation.
+	//
+	// It is given the handles rather than a condition to evaluate, because
+	// waiting on a named set of outstanding work is the primitive engines
+	// tend to offer. Use AnyReady if it is easier to poll.
+	Await(ctx context.Context, fs []Future) error
+}
+
+// AnyReady reports whether any of fs has finished. Engines implementing
+// Await on top of a polling or condition-based primitive will want it.
+func AnyReady(fs []Future) bool {
+	for _, f := range fs {
+		if f.IsReady() {
+			return true
+		}
+	}
+	return false
 }
 
 // Work is a unit of work a cue declared with Do. Every field is here so that
@@ -102,8 +117,8 @@ func (e *goEngine) start(fn func() error) Future {
 	return f
 }
 
-func (e *goEngine) Await(ctx context.Context, ready func() bool) error {
-	for !ready() {
+func (e *goEngine) Await(ctx context.Context, fs []Future) error {
+	for !AnyReady(fs) {
 		select {
 		case <-e.wake:
 		case <-ctx.Done():
@@ -159,8 +174,8 @@ func (serialEngine) Execute(ctx context.Context, w Work) Future {
 	return ReadyFuture{Err: w.Local(ctx)}
 }
 
-func (serialEngine) Await(_ context.Context, ready func() bool) error {
-	if ready() {
+func (serialEngine) Await(_ context.Context, fs []Future) error {
+	if AnyReady(fs) {
 		return nil
 	}
 	return errors.New("serial engine has nothing left to run")

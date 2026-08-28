@@ -475,7 +475,7 @@ func (r *runner[I, S]) isStable() bool {
 
 // wait yields to the Engine until a cue has finished, then absorbs exactly one.
 func (r *runner[I, S]) wait() error {
-	if err := r.engine.Await(r.ctx, r.anyReady); err != nil {
+	if err := r.engine.Await(r.ctx, r.futures()); err != nil {
 		return fmt.Errorf("deck run aborted: %w", err)
 	}
 	for i, a := range r.inflight {
@@ -488,13 +488,14 @@ func (r *runner[I, S]) wait() error {
 	return errors.New("deck run stalled: the engine returned before any cue had finished")
 }
 
-func (r *runner[I, S]) anyReady() bool {
+// futures lists what the run is currently waiting on, for the Engine to wait
+// on in whatever way suits it.
+func (r *runner[I, S]) futures() []Future {
+	fs := make([]Future, 0, len(r.inflight))
 	for _, a := range r.inflight {
-		if a.future.IsReady() {
-			return true
-		}
+		fs = append(fs, a.future)
 	}
-	return false
+	return fs
 }
 
 // absorb applies one finished cue's outcome. A cue's error takes precedence

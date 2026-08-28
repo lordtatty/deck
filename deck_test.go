@@ -2082,11 +2082,11 @@ func (e *coopEngine) enqueue(fn func() error) deck.Future {
 	return f
 }
 
-func (e *coopEngine) Await(_ context.Context, ready func() bool) error {
+func (e *coopEngine) Await(_ context.Context, fs []deck.Future) error {
 	if e.awaitErr != nil {
 		return e.awaitErr
 	}
-	for !ready() {
+	for !deck.AnyReady(fs) {
 		if len(e.queue) == 0 {
 			return errors.New("scheduler deadlocked: nothing left to run")
 		}
@@ -2568,7 +2568,7 @@ func (e *loggingEngine) Spawn(fn func()) deck.Future {
 // a broken engine.
 type spuriousAwaitEngine struct{ deck.Engine }
 
-func (e *spuriousAwaitEngine) Await(context.Context, func() bool) error { return nil }
+func (e *spuriousAwaitEngine) Await(context.Context, []deck.Future) error { return nil }
 
 // failAfterEngine yields normally, then fails — an engine cancelled partway
 // through a run.
@@ -2579,12 +2579,12 @@ type failAfterEngine struct {
 	calls int
 }
 
-func (e *failAfterEngine) Await(ctx context.Context, ready func() bool) error {
+func (e *failAfterEngine) Await(ctx context.Context, fs []deck.Future) error {
 	e.calls++
 	if e.calls > e.after {
 		return e.err
 	}
-	return e.Engine.Await(ctx, ready) //nolint:wrapcheck // delegating to the wrapped engine
+	return e.Engine.Await(ctx, fs) //nolint:wrapcheck // delegating to the wrapped engine
 }
 
 // --- Declared work ---
@@ -2760,4 +2760,77 @@ func TestDeck_Run_Do_TellsTheEngineWhichCueDeclaredTheWork(t *testing.T) {
 	require.Len(t, engine.works, 2)
 	assert.Equal(t, "alpha", engine.works[0].CueName)
 	assert.Equal(t, "beta", engine.works[1].CueName)
+}
+
+// whenAnyEngine models an engine whose only waiting primitive is "block until
+// one of these handles is done" — the shape durable-execution engines other
+// than Temporal tend to offer. It is never handed a predicate, only the
+// futures, so it can only be written if Await says what it is waiting on.
+type whenAnyEngine struct {
+	queue []func()
+}
+
+func (e *whenAnyEngine) Now() time.Time { return time.Now() }
+
+func (e *whenAnyEngine) Spawn(fn func()) deck.Future {
+	return e.enqueue(func() error { fn(); return nil })
+}
+
+func (e *whenAnyEngine) Execute(ctx context.Context, w deck.Work) deck.Future {
+	return e.enqueue(func() error { return w.Local(ctx) })
+}
+
+func (e *whenAnyEngine) enqueue(fn func() error) deck.Future {
+	f := &coopFuture{}
+	e.queue = append(e.queue, func() {
+		f.err = fn()
+		f.ready = true
+	})
+	return f
+}
+
+func (e *whenAnyEngine) Await(_ context.Context, fs []deck.Future) error {
+	for !deck.AnyReady(fs) {
+		if len(e.queue) == 0 {
+			return errors.New("nothing left to run")
+		}
+		next := e.queue[0]
+		e.queue = e.queue[1:]
+		next()
+	}
+	return nil
+}
+
+func TestDeck_Run_EngineThatCanOnlyWaitOnHandles(t *testing.T) {
+	// Given cues that declare work, and an engine with no way to evaluate a
+	// condition — it can only be told which handles to wait on
+	mkCue := func(name, needs string) deck.Cue[struct{}, workState] {
+		c := deck.Cue[struct{}, workState]{
+			Name: name,
+			Run: func(_ struct{}, _ workState) (deck.Mutation[workState], error) {
+				return deck.Do(slowValue, name, func(v string) deck.Mutation[workState] {
+					return deck.Complete(func(s *workState) { s.Values = append(s.Values, v) })
+				}), nil
+			},
+		}
+		if needs != "" {
+			c.When = func(_ struct{}, _ workState, r deck.Result) bool { return r.Completed(needs) }
+		}
+		return c
+	}
+
+	sut, err := deck.New(mkCue("a", ""), mkCue("b", ""), mkCue("c", "a"))
+	require.NoError(t, err)
+	sut.Engine = &whenAnyEngine{}
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state := &workState{}
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
+
+	// Then it completes exactly as it would on any other engine
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"value:a", "value:b", "value:c"}, state.Values)
+	assert.Len(t, result.CompletedCues, 3)
 }

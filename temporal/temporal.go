@@ -111,10 +111,10 @@ func (e *engine) Execute(_ context.Context, w deck.Work) deck.Future {
 	}
 }
 
-// Await yields the workflow coroutine until ready reports true, letting the
-// activities started above make progress.
-func (e *engine) Await(_ context.Context, ready func() bool) error {
-	if err := workflow.Await(e.ctx, ready); err != nil {
+// Await yields the workflow coroutine until one of the activities started
+// above has finished, letting them all make progress meanwhile.
+func (e *engine) Await(_ context.Context, fs []deck.Future) error {
+	if err := workflow.Await(e.ctx, func() bool { return deck.AnyReady(fs) }); err != nil {
 		return fmt.Errorf("workflow await: %w", err)
 	}
 	return nil

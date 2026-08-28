@@ -216,7 +216,16 @@ d.Engine = deck.Serial()  // one at a time, in registration order — reproducib
 
 `deck.Serial()` is what you want in a test that asserts on ordering: it runs each cue inline to completion, so the same run happens the same way every time. `deck.WithClock(engine, now)` layers a fixed clock onto any engine so `CompletedCue` timestamps are predictable too.
 
-Anything satisfying the `Engine` interface will do — `Now`, `Spawn`, `Execute`, `Await` — so you can supply your own.
+Anything satisfying the `Engine` interface will do, so you can supply your own. The contract is deliberately small, and nothing in it is specific to any one system — an engine has to:
+
+1. give a clock (`Now`)
+2. run a closure and say when it is done (`Spawn`)
+3. take a function, an argument and somewhere to put the result, run it *somewhere*, and say when it is done (`Execute`)
+4. block until at least one outstanding piece of work is done (`Await`)
+
+`Await` is handed the outstanding handles rather than a condition to evaluate, because "wait for any of these" is the primitive durable-execution engines tend to offer. `deck.AnyReady(futures)` is there for engines that would rather poll.
+
+`deck/temporal` is one implementation of that contract, in under 150 lines. The core has no dependency on it, or on anything else.
 
 ### Declaring Work Instead of Doing It
 
