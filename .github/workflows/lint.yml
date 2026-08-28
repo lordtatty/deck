@@ -19,6 +19,7 @@ jobs:
           - examples/concurrent
           - examples/jobqueue
           - examples/engines
+          - examples/portable
           - examples/temporal
           - temporal
     steps:

@@ -1,153 +1,210 @@
-// The same deck flow, run twice: once as ordinary Go, once inside a Temporal
-// workflow where it is durable — if the process dies mid-flow, it picks up
-// where it left off on another machine.
+// A deck flow built for Temporal, using the things you go to Temporal for:
+// automatic retries of flaky work, different timeouts per unit of work, and a
+// full history you can open in a browser afterwards.
 //
-// The cues are in ./flow and are identical in both runs. Only the Engine
-// changes.
+//	go run .            run the flow and exit
+//	go run . -ui        run it, then leave the Web UI up so you can read the history
 //
-//	go run .
-//
-// The first run downloads a Temporal dev server (a one-off, cached by the SDK).
-// Nothing else to install.
+// A dev server is started for you and thrown away at the end.
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"time"
 
 	"github.com/lordtatty/deck"
-	"github.com/lordtatty/deck/examples/temporal/flow"
 	decktemporal "github.com/lordtatty/deck/temporal"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 )
 
-const taskQueue = "deck-example"
+const taskQueue = "orders"
 
-// ---------------------------------------------------------------------------
-// Plain Go
-// ---------------------------------------------------------------------------
-
-func runLocally(in flow.Input) flow.State {
-	d, err := deck.New(flow.Cues()...)
-	if err != nil {
-		log.Fatalf("building deck: %v", err)
-	}
-	// No Engine set, so cues run on goroutines against the wall clock.
-
-	var state flow.State
-	if _, err := d.Run(context.Background(), in, &state); err != nil {
-		log.Fatalf("running locally: %v", err)
-	}
-	return state
+type Order struct {
+	ID string `json:"id"`
 }
 
-// ---------------------------------------------------------------------------
-// Inside a Temporal workflow
-// ---------------------------------------------------------------------------
+type Fulfilment struct {
+	Stock    string   `json:"stock"`
+	Payment  string   `json:"payment"`
+	Shipment string   `json:"shipment"`
+	Outcome  string   `json:"outcome"`
+	Timeline []string `json:"timeline"`
+}
 
-// ReportWorkflow is the whole integration. Two lines of it are about Temporal;
-// the rest is the same deck code you would write anywhere.
-func ReportWorkflow(ctx workflow.Context, in flow.Input) (flow.State, error) {
-	// Activity settings are yours to choose — deck will not invent them. Use
-	// decktemporal.ForCue("name", opts) where one cue needs different settings
-	// from the rest.
+// cues describes the flow. Stock and payment are independent, so they go out
+// together; shipping waits for both; the confirmation waits for shipping.
+//
+// Nothing here mentions retries or timeouts. Those are Temporal's business, and
+// they are configured in the workflow below.
+func cues() []deck.Cue[Order, Fulfilment] {
+	return []deck.Cue[Order, Fulfilment]{
+		{
+			Name: "reserve",
+			Run: func(o Order, _ Fulfilment) (deck.Mutation[Fulfilment], error) {
+				return deck.Do(ReserveStock, o.ID, func(v string) deck.Mutation[Fulfilment] {
+					return deck.Complete(func(f *Fulfilment) { f.Stock = v })
+				}), nil
+			},
+		},
+		{
+			Name: "charge",
+			Run: func(o Order, _ Fulfilment) (deck.Mutation[Fulfilment], error) {
+				return deck.Do(ChargePayment, o.ID, func(v string) deck.Mutation[Fulfilment] {
+					return deck.Complete(func(f *Fulfilment) { f.Payment = v })
+				}), nil
+			},
+		},
+		{
+			Name: "ship",
+			When: func(_ Order, _ Fulfilment, r deck.Result) bool {
+				return r.Completed("reserve") && r.Completed("charge")
+			},
+			Run: func(o Order, _ Fulfilment) (deck.Mutation[Fulfilment], error) {
+				return deck.Do(ShipOrder, o.ID, func(v string) deck.Mutation[Fulfilment] {
+					return deck.Complete(func(f *Fulfilment) { f.Shipment = v })
+				}), nil
+			},
+		},
+		{
+			// No work of its own — it only reads state, so a plain Complete.
+			Name: "confirm",
+			When: func(_ Order, _ Fulfilment, r deck.Result) bool {
+				return r.Completed("ship")
+			},
+			Run: func(o Order, f Fulfilment) (deck.Mutation[Fulfilment], error) {
+				outcome := fmt.Sprintf("order %s complete (%s, %s, %s)",
+					o.ID, f.Stock, f.Payment, f.Shipment)
+				return deck.Complete(func(f *Fulfilment) { f.Outcome = outcome }), nil
+			},
+		},
+	}
+}
+
+// FulfilOrder is where deck and Temporal meet. Everything Temporal-specific
+// about this flow lives in this function.
+func FulfilOrder(ctx workflow.Context, order Order) (Fulfilment, error) {
+	// The house rules for every cue's work: half a second, and up to five
+	// attempts a tenth of a second apart. ChargePayment leans on this — it
+	// fails twice before it works, and nothing in the flow has to care.
 	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout: time.Minute,
+		StartToCloseTimeout: 500 * time.Millisecond,
+		RetryPolicy: &temporal.RetryPolicy{
+			MaximumAttempts: 5,
+			InitialInterval: 100 * time.Millisecond,
+		},
 	})
 
-	d, err := deck.New(flow.Cues()...)
+	d, err := deck.New(cues()...)
 	if err != nil {
-		return flow.State{}, fmt.Errorf("building deck: %w", err)
+		return Fulfilment{}, fmt.Errorf("building deck: %w", err)
 	}
 
-	// The one line that makes this durable. Now a cue's Run executes inline on
-	// the workflow coroutine, and the work it declares becomes an activity.
-	d.Engine = decktemporal.New(ctx)
+	d.Engine = decktemporal.New(ctx,
+		// Shipping takes 1.5s, so the house rule above would time it out and
+		// then retry it forever. Activity options are Temporal's own type, so
+		// naming the cue here keeps the flow itself free of Temporal — and puts
+		// the timeout beside the other deployment decisions.
+		decktemporal.ForCue("ship", workflow.ActivityOptions{
+			StartToCloseTimeout: 10 * time.Second,
+			RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 3},
+		}),
+	)
 
-	// Cancellation comes from the workflow context the Engine holds, so the
-	// context passed here is just a placeholder.
-	var state flow.State
-	if _, err := d.Run(context.Background(), in, &state); err != nil {
-		return state, fmt.Errorf("running deck: %w", err)
-	}
-	return state, nil
-}
-
-func runInTemporal(c client.Client, in flow.Input) flow.State {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
-		ID:        fmt.Sprintf("deck-example-%d", time.Now().UnixNano()),
-		TaskQueue: taskQueue,
-	}, ReportWorkflow, in)
+	var f Fulfilment
+	result, err := d.Run(context.Background(), order, &f)
 	if err != nil {
-		log.Fatalf("starting workflow: %v", err)
+		return f, fmt.Errorf("fulfilling order: %w", err)
 	}
 
-	var state flow.State
-	if err := run.Get(ctx, &state); err != nil {
-		log.Fatalf("workflow failed: %v", err)
+	// Result carries each cue that completed, in the order it completed, and
+	// how long it took. Under Temporal those stamps come from workflow.Now, so
+	// they mark workflow task boundaries rather than exact wall-clock time.
+	for _, c := range result.CompletedCues {
+		f.Timeline = append(f.Timeline, fmt.Sprintf("%-8s %v", c.Name, c.Duration()))
 	}
-	return state
+	return f, nil
 }
 
 func main() {
-	in := flow.Input{CustomerID: "cust-42"}
+	keepUI := flag.Bool("ui", false, "leave the Web UI running when the flow finishes")
+	flag.Parse()
 
-	fmt.Println("The profile and orders lookups take 400ms each and do not")
-	fmt.Println("depend on each other. In series that is 800ms; together, 400ms.")
+	fmt.Println("Fulfilling an order. Watch the payment step:")
+	fmt.Println("it fails twice, and Temporal retries it without the flow knowing.")
 	fmt.Println()
 
-	start := time.Now()
-	local := runLocally(in)
-	fmt.Printf("plain Go   %-34s %v\n", local.Report, time.Since(start).Round(10*time.Millisecond))
-
-	fmt.Println()
-	fmt.Println("Starting a Temporal dev server (downloaded once, then cached)...")
-	c, stop := devServer()
+	srv, stop := devServer()
 	defer stop()
+	c := srv.Client()
 
-	// A worker runs both the workflow and the functions the cues declared. Note
-	// that FetchProfile and FetchOrders are registered exactly as written — the
-	// flow package needed no Temporal-specific version of them.
 	w := worker.New(c, taskQueue, worker.Options{})
-	w.RegisterWorkflow(ReportWorkflow)
-	w.RegisterActivity(flow.FetchProfile)
-	w.RegisterActivity(flow.FetchOrders)
+	w.RegisterWorkflow(FulfilOrder)
+	w.RegisterActivity(ReserveStock)
+	w.RegisterActivity(ChargePayment)
+	w.RegisterActivity(ShipOrder)
 	if err := w.Start(); err != nil {
 		log.Fatalf("starting worker: %v", err)
 	}
 	defer w.Stop()
 
-	start = time.Now()
-	durable := runInTemporal(c, in)
-	fmt.Printf("Temporal   %-34s %v\n", durable.Report, time.Since(start).Round(10*time.Millisecond))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:        fmt.Sprintf("order-%d", time.Now().UnixNano()),
+		TaskQueue: taskQueue,
+	}, FulfilOrder, Order{ID: "A-1001"})
+	if err != nil {
+		log.Fatalf("starting workflow: %v", err)
+	}
+
+	var f Fulfilment
+	if err := run.Get(ctx, &f); err != nil {
+		log.Fatalf("workflow failed: %v", err)
+	}
 
 	fmt.Println()
-	if local.Report == durable.Report {
-		fmt.Println("Same cues, same answer, parallel in both — and the Temporal run")
-		fmt.Println("would survive the process being killed halfway through.")
+	fmt.Println(f.Outcome)
+	fmt.Println()
+	fmt.Println("deck's Result, in completion order:")
+	for _, line := range f.Timeline {
+		fmt.Println("    " + line)
+	}
+	fmt.Println()
+	fmt.Println("Three things happened there that you would otherwise have written yourself:")
+	fmt.Println("  - the payment retried twice and then succeeded, with no retry code in the flow")
+	fmt.Println("  - shipping got its own timeout via ForCue, while everything else kept the strict one")
+	fmt.Println("  - every attempt is recorded, so the run can be replayed or resumed on another machine")
+
+	if *keepUI {
+		fmt.Printf("\nWeb UI: http://localhost:%s — workflow %s\n", uiPort, run.GetID())
+		fmt.Println("Press Ctrl-C when you have finished looking.")
+		select {}
 	}
 }
 
-// devServer starts a throwaway Temporal server so this example runs with no
-// setup. In a real service you would dial your own instead:
+const uiPort = "8233"
+
+// devServer starts a throwaway Temporal server so the example needs no setup.
+// In a real service you would dial your own:
 //
 //	c, err := client.Dial(client.Options{HostPort: "temporal:7233"})
-func devServer() (client.Client, func()) {
+func devServer() (*testsuite.DevServer, func()) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	// Quiet: this example is about deck, not about Temporal's logs.
 	srv, err := testsuite.StartDevServer(ctx, testsuite.DevServerOptions{
 		ClientOptions: &client.Options{Logger: quietLogger{}},
+		EnableUI:      true,
+		UIPort:        uiPort,
 		LogLevel:      "error",
 		Stdout:        io.Discard,
 		Stderr:        io.Discard,
@@ -155,7 +212,7 @@ func devServer() (client.Client, func()) {
 	if err != nil {
 		log.Fatalf("starting dev server: %v", err)
 	}
-	return srv.Client(), func() { _ = srv.Stop() }
+	return srv, func() { _ = srv.Stop() }
 }
 
 // quietLogger keeps the SDK's chatter out of the example's output. Swap it for
@@ -165,6 +222,10 @@ type quietLogger struct{}
 func (quietLogger) Debug(string, ...any) {}
 func (quietLogger) Info(string, ...any)  {}
 func (quietLogger) Warn(string, ...any)  {}
-func (quietLogger) Error(msg string, keyvals ...any) {
-	log.Println(append([]any{"temporal:", msg}, keyvals...)...)
+
+// Error stays visible: the payment gateway is meant to fail twice here, and
+// seeing Temporal notice is half the point. Send these to your own logger in a
+// real service.
+func (quietLogger) Error(msg string, _ ...any) {
+	fmt.Printf("    %-9s %s\n", "temporal", msg)
 }

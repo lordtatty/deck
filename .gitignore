@@ -7,4 +7,5 @@ state.json
 /examples/concurrent/concurrent
 /examples/jobqueue/jobqueue
 /examples/engines/engines
+/examples/portable/portable
 /examples/temporal/temporal
