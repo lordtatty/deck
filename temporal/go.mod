@@ -3,7 +3,7 @@ module github.com/lordtatty/deck/temporal
 go 1.25.4
 
 require (
-	github.com/lordtatty/deck v0.0.0
+	github.com/lordtatty/deck v0.1.0
 	github.com/stretchr/testify v1.11.1
 	go.temporal.io/api v1.63.4
 	go.temporal.io/sdk v1.48.0
@@ -34,4 +34,7 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
+// Local development only. A replace is ignored by anything that depends on
+// this module, so the require above must name a version that really exists —
+// consumers resolve that one.
 replace github.com/lordtatty/deck => ..
