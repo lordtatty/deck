@@ -19,3 +19,7 @@ jobs:
 
     - name: Test
       run: go test -race -v ./...
+
+    - name: Test (temporal module)
+      working-directory: temporal
+      run: go test -race -v ./...
