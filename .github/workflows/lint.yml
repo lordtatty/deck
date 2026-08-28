@@ -18,6 +18,8 @@ jobs:
           - examples/basic
           - examples/concurrent
           - examples/jobqueue
+          - examples/engines
+          - examples/temporal
           - temporal
     steps:
       - uses: actions/checkout@v4
