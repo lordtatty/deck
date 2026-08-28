@@ -7,10 +7,13 @@ A streamlined Go package for orchestrating concurrent, state-driven agent execut
 ## Key Concepts
 
 *   **Input vs State**: Each run has an immutable input `I` (read-only data that defines the run — a user message, request parameters) and a mutable state `S` (progress built up by cues). Input is passed by value to every cue and is never persisted. State is mutated via `Mutation`s and persisted by `Export`/`Import`.
-*   **Stateless Deck**: The `Deck` struct is immutable and stateless. Input and state are passed to `Run()`.
+*   **Stateless Deck**: A `Deck` holds no run state — input and state are passed to `Run()`, and a run never writes back to the Deck. The one field you may set is `Engine`.
 *   **Isolated Execution**: `Run()` operates on a copy of the state. External modifications during execution are ignored. On success, the final state is copied back.
 *   **Concurrent Cues**: Triggered cues run concurrently. State updates are serialised via mutation functions.
+*   **Engine**: Where cues run. Leave it nil for goroutines and the wall clock, or set it to run one at a time for a reproducible test — or inside a Temporal workflow, where the flow becomes durable.
+*   **Declared Work**: A cue can perform its work itself, or describe it with `deck.Do` and let the Engine perform it. Describing it is what lets one set of cues run both locally and durably.
 *   **Result History**: `Run()` returns a `Result` struct containing execution history, which cues can inspect.
+*   **Contained Panics**: a panic in a cue becomes that cue's error, with a stack trace, rather than ending the process.
 *   **Suspend/Resume**: Cues can signal suspension for long-running async work. The Deck stops cleanly and can be resumed later.
 *   **Export/Import**: Serialise state and result to bytes with `Export()` and restore with `Import()`. Input is **not** in the snapshot — the caller provides it fresh on resume.
 
@@ -201,6 +204,146 @@ state := &DashboardState{}
 result, err := d.Run(ctx, input, state)
 ```
 
+### Where Cues Run — the Engine
+
+By default a Deck runs each cue on its own goroutine and reads the wall clock. `Engine` changes that without touching a single cue:
+
+```go
+d, _ := deck.New(cues...)
+
+d.Engine = nil            // the default: a goroutine per cue, wall clock
+d.Engine = deck.Serial()  // one at a time, in registration order — reproducible
+```
+
+`deck.Serial()` is what you want in a test that asserts on ordering: it runs each cue inline to completion, so the same run happens the same way every time. `deck.WithClock(engine, now)` layers a fixed clock onto any engine so `CompletedCue` timestamps are predictable too.
+
+Because an Engine may run your cues on goroutines it owns, deck recovers panics in cue code and reports them as that cue's error, with a stack trace:
+
+```
+cue Boom: panic: cue exploded
+
+goroutine 9 [running]:
+...
+```
+
+The run then stops and drains exactly as it would for a returned error. Without this, a panic on an Engine's goroutine would take the process down and the caller could do nothing about it — `recover` never sees a panic from another goroutine. It applies to a cue's `Run`, to work declared with `Do`, and to the handler `Do` was given, so the behaviour is the same under every Engine.
+
+Anything satisfying the `Engine` interface will do, so you can supply your own. The contract is deliberately small, and nothing in it is specific to any one system — an engine has to:
+
+1. give a clock (`Now`)
+2. run a closure and say when it is done (`Spawn`)
+3. take a function, an argument and somewhere to put the result, run it *somewhere*, and say when it is done (`Execute`)
+4. block until at least one outstanding piece of work is done (`Await`)
+
+`Await` is handed the outstanding handles rather than a condition to evaluate, because "wait for any of these" is the primitive durable-execution engines tend to offer. `deck.AnyReady(futures)` is there for engines that would rather poll.
+
+`deck/temporal` is one implementation of that contract, in under 150 lines. The core has no dependency on it, or on anything else.
+
+### Declaring Work Instead of Doing It
+
+A cue that *does* its work is tied to the process it runs in. A cue that *declares* it can run anywhere:
+
+```go
+// An ordinary Go function. It is also exactly the shape of a Temporal activity.
+func FetchUser(ctx context.Context, id string) (User, error) { ... }
+
+Run: func(in Input, s State) (deck.Mutation[State], error) {
+    return deck.Do(FetchUser, in.UserID, func(u User) deck.Mutation[State] {
+        return deck.Complete(func(s *State) { s.User = u })
+    }), nil
+},
+```
+
+`deck.Do` returns immediately — it hands the work to the Engine and lets the Deck carry on triggering other cues. That is where the parallelism comes from, and it is why the same cue works whether the Engine runs the function on a goroutine or dispatches it to a worker on another machine.
+
+#### `Do` or `Complete`?
+
+Not every cue should declare work. Most flows are a mixture:
+
+| Use | When | Cost under Temporal |
+|---|---|---|
+| `deck.Do` | The work leaves the process, is slow, or is not deterministic — a network call, a database query, an LLM request | One activity: retried, timed out and recorded independently |
+| `deck.Complete` | The cue only computes from state it already holds | None. It runs inline as workflow code |
+
+A join cue that formats a string from what the others fetched should be a `Complete`. Making it a `Do` would cost a round trip to the Temporal server and an entry in the workflow history to run a `Sprintf`, and would gain nothing — there is nothing there that can fail, time out, or need retrying.
+
+The distinction is load-bearing under Temporal, and harmless without it: with the default Engine, `Do` simply runs the function on a goroutine.
+
+One thing to be careful of: a cue that does slow or non-deterministic work **inline in `Run`** is fine in plain Go, but under Temporal it runs on the workflow coroutine, where it will break replay or trip the deadlock detector. That is what `Do` exists to avoid.
+
+### Running Durably with Temporal
+
+`deck/temporal` is a separate module, so `go get` on the core pulls no Temporal dependency. Attaching it is one visible line:
+
+```go
+func MyWorkflow(ctx workflow.Context, in Input) (State, error) {
+    // Activity settings are yours to choose; deck will not invent them.
+    ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+        StartToCloseTimeout: time.Minute,
+    })
+
+    d, err := deck.New(cues...)
+    if err != nil {
+        return State{}, err
+    }
+    d.Engine = decktemporal.New(ctx)
+
+    var state State
+    _, err = d.Run(context.Background(), in, &state)
+    return state, err
+}
+```
+
+Work declared with `deck.Do` becomes a Temporal activity — register the same functions with your worker and Temporal resolves them by name. Cues still run in parallel: independent activities all go out before any of them is waited on.
+
+#### One way the two worlds are not identical
+
+The cues are the same, but the journey your data takes is not. Locally, `Do` calls your function directly — same process, same memory, nothing touched. Under a durable engine the work may run on another machine, so the argument and the result travel as JSON.
+
+That means ordinary Go encoding rules apply to anything crossing that line, and the quiet case is the one to watch:
+
+```go
+type Order struct {
+    ID     string   // exported  — survives
+    region string   // unexported — arrives empty, with no error anywhere
+}
+```
+
+Run locally, `region` is intact. Run on Temporal, it is `""`. Nothing fails: deck sees no error, and Temporal is doing exactly what `encoding/json` is meant to do. Your tests pass and production is quietly wrong.
+
+Use exported fields for anything passed to `Do` or returned from it, and no functions or channels. Nothing about this is specific to deck — writing the activity by hand behaves the same way — but deck makes the boundary invisible, so it is worth knowing where it is.
+
+If you genuinely need something across that boundary which JSON cannot carry, Temporal's [`DataConverter`](https://pkg.go.dev/go.temporal.io/sdk/client#Options) is the supported hook: set it on the client once and it applies to everything the application sends. Deck deliberately does not encode arguments itself — doing so would make the workflow history opaque in the UI, and would sit underneath the very thing designed for this.
+
+Build the Deck once and give each workflow its own engine with `WithEngine` — a worker runs many workflows at a time, and assigning to `d.Engine` would have them all writing the same field:
+
+```go
+var flow, _ = deck.New(cues...)   // once, at startup
+
+func MyWorkflow(ctx workflow.Context, in Input) (State, error) {
+    d := flow.WithEngine(decktemporal.New(ctx))
+    ...
+}
+```
+
+Where one cue needs different activity settings from the rest, name it in the wiring rather than in the flow:
+
+```go
+d.Engine = decktemporal.New(ctx,
+    decktemporal.ForCue("ship", workflow.ActivityOptions{
+        StartToCloseTimeout: 10 * time.Minute,
+    }),
+)
+```
+
+If your flow uses `Suspend`/`Export`/`Import`, see [Suspend, or a durable engine?](#suspend-or-a-durable-engine) — under Temporal you usually want neither of them.
+
+Three things worth knowing:
+
+- **Cancellation** reaches the Deck through the Engine's workflow context, not through the context passed to `Run`. Pass `context.Background()` there.
+- **A cue's `Run` executes inline** on the workflow coroutine, so it must not block. Declare work with `deck.Do`; a cue that blocks will trip Temporal's deadlock detector.
+- **`CompletedCue` timestamps** come from `workflow.Now`, which reports when the current workflow task started. A cue that starts and finishes inside one task reports a zero `Duration`.
+
 ### Suspend and Resume for Long-Running Jobs
 
 When a cue kicks off work that may take a long time (e.g. an API batch job), it returns `deck.Suspended()` instead of `deck.Complete()`. This:
@@ -380,18 +523,53 @@ The typical flow with two concurrent suspends:
 
 If both webhooks arrive simultaneously, one worker gets the lock and processes. The second worker waits or retries with the updated snapshot — no duplicated work.
 
+### Suspend, or a durable engine?
+
+`Suspend`/`Export`/`Import` and a durable Engine solve the same problem — work that outlives the process — by opposite means. Both are fully supported; which you want depends on whether you have a workflow engine.
+
+**Without one, `Suspend` is the answer**, and nothing about it has changed. A cue kicks off async work and suspends, you persist the snapshot wherever you like, and any worker can pick it up when the callback arrives. `examples/jobqueue` is that pattern end to end with Redis. Deck carries the state; you carry the durability.
+
+**With Temporal, you usually want neither.** The engine is already keeping your flow alive across process death — that is what [the durability tests](temporal) demonstrate — so suspending to persist state yourself gives up what you came for: the workflow ends, its history stops there, and resuming means starting a new one and rebuilding state by hand.
+
+For the case `Suspend` exists for — *kick something off and come back when it answers* — Temporal has better-fitting tools:
+
+| You want | Reach for |
+|---|---|
+| Work that takes minutes or hours | `deck.Do` with a generous `StartToCloseTimeout`, and heartbeats if it is long |
+| An external system that calls **you** back | An activity using Temporal's async completion (the task-token pattern): the activity returns `ErrResultPending` and something else completes it later |
+| To wait for an event or a decision | A signal, awaited inside the activity or the workflow |
+
+In each case the cue stays a normal `Do` and the flow never stops.
+
+**Suspend does still work under a Temporal Engine** if you want it — a suspending cue applies its mutation, the run drains and returns `Suspended`, and `Export`/`Import` round-trip as usual, all of it deterministic and replay-safe. There is a test pinning exactly that, so the option is real rather than accidental. It is just rarely the tool you want once something else is already guaranteeing your flow survives.
+
 ## Runnable Examples
 
-The `examples/` directory contains complete, runnable examples. Each demonstrates the I/S split:
+The [`examples/`](examples) directory contains complete, runnable examples, each with its own module. [`examples/README.md`](examples/README.md) indexes them.
 
-| Example | Input | What it shows |
-|---|---|---|
-| `examples/basic` | `PipelineInput{Source}` | Three-stage pipeline: Prepare → Process → Summarise |
-| `examples/concurrent` | `DashboardInput{ReportTitle}` | Three parallel data fetches + report generation |
-| `examples/jobqueue` | `JobInput{JobID, Topic, Style}` | Testcontainers Redis job queue with stateless workers, webhooks, and two concurrent suspending cues — input lives at `jobs:<id>:input`, snapshots at `jobs:<id>:snapshot` |
+**Plain deck**, no extra dependencies:
 
-The jobqueue example has its own `go.mod` to keep heavy dependencies out of the root module. Run it with:
+| Example | What it shows |
+|---|---|
+| `examples/basic` | Three-stage pipeline: Prepare → Process → Summarise |
+| `examples/concurrent` | Three parallel data fetches + report generation |
+| `examples/engines` | One set of cues under two Engines, side by side: concurrent and shortest-first, versus inline and reproducible. Also where to reach for `Do` and where for `Complete`. |
+| `examples/jobqueue` | Testcontainers Redis job queue with stateless workers, webhooks, and two concurrent suspending cues |
+
+**With Temporal.** Three examples, because they answer three different questions — pick the one matching what you are trying to work out:
+
+| Example | The question it answers |
+|---|---|
+| `examples/portable` | *"Will my cues really run unchanged in both worlds?"* The same flow run locally and then on Temporal, back to back, reaching the same answer. The simplest possible demonstration — no indirection to read past. |
+| `examples/eitherway` | *"How do I build one service that can do either?"* The same idea as `portable`, but arranged the way you would actually ship it: a `Runner` interface, and the choice made once at startup from a flag. |
+| `examples/temporal` | *"What does Temporal actually give me?"* Order fulfilment on Temporal alone: a payment that fails twice and is retried with no retry code in the flow, per-cue timeouts via `ForCue`, and a Web UI to read the history. |
+
+Read them in that order if you are new to the pairing: `portable` shows it works, `eitherway` shows how to arrange it, `temporal` shows what you gain by it.
+
+Each example is its own module, keeping heavy dependencies out of the root. Run any of them with:
 
 ```sh
-cd examples/jobqueue && go run .
+cd examples/engines && go run .
 ```
+
+The Temporal examples start a throwaway dev server themselves, so there is nothing to install first.

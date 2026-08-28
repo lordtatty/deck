@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1862,14 +1863,13 @@ func TestDeck_Run_InjectedNow_StampsCompletedCueTimes(t *testing.T) {
 
 	sut, err := deck.New(cue)
 	require.NoError(t, err)
-	sut.Now = func() time.Time {
-		// Now runs inside each cue; a bare counter would race under the
-		// default Spawn.
+	sut.Engine = deck.WithClock(deck.Goroutines(), func() time.Time {
+		// Now is called from inside each cue; a bare counter would race.
 		mu.Lock()
 		defer mu.Unlock()
 		ticks++
 		return base.Add(time.Duration(ticks) * time.Second)
-	}
+	})
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -1900,7 +1900,7 @@ func TestDeck_Run_SerialSpawn_RunsEachCueToCompletionBeforeTheNext(t *testing.T)
 
 	sut, err := deck.New(mkCue("A"), mkCue("B"), mkCue("C"))
 	require.NoError(t, err)
-	sut.Spawn = func(fn func()) { fn() }
+	sut.Engine = deck.Serial()
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -1930,11 +1930,10 @@ func executionModes() []executionMode {
 	return []executionMode{
 		{"goroutine", func(*deck.Deck[struct{}, TestState]) {}},
 		{"serial", func(d *deck.Deck[struct{}, TestState]) {
-			d.Spawn = func(fn func()) { fn() }
+			d.Engine = deck.Serial()
 		}},
 		{"scheduler", func(d *deck.Deck[struct{}, TestState]) {
-			sched := &coopScheduler{}
-			d.Spawn, d.Await = sched.spawn, sched.await
+			d.Engine = newCoopEngine()
 		}},
 	}
 }
@@ -1962,6 +1961,12 @@ func runBounded[I, S any](t *testing.T, d *deck.Deck[I, S], ctx context.Context,
 	}
 }
 
+// The next two run under every execution mode on purpose. Each mode reaches
+// cancellation by a different route, and two of them once ignored it entirely:
+// a serial Engine finishes its work before anything checks ctx, and an awaiting
+// Engine hands waiting to the caller's scheduler. Cancellation is now checked
+// between cycles precisely so all three behave alike, and running the same
+// assertions across the table is what keeps that true.
 func TestDeck_Run_AlreadyCancelledContext_TriggersNothing(t *testing.T) {
 	marker := t.Name()
 	for _, mode := range executionModes() {
@@ -2001,6 +2006,10 @@ func TestDeck_Run_AlreadyCancelledContext_TriggersNothing(t *testing.T) {
 	}
 }
 
+// The harder half of the pair: cancelled mid-flight rather than up front, and
+// the half that regressed once. Counting how often the second cue starts is
+// what catches it — a chain that keeps triggering work under a dead context
+// still returns an error at the end, so asserting on the error alone passes.
 func TestDeck_Run_CancelledFromInsideACue_TriggersNoFurtherCues(t *testing.T) {
 	marker := t.Name()
 	for _, mode := range executionModes() {
@@ -2046,32 +2055,74 @@ func TestDeck_Run_CancelledFromInsideACue_TriggersNoFurtherCues(t *testing.T) {
 	}
 }
 
-// coopScheduler models a cooperative scheduler like Temporal's deterministic
-// runner: spawned work is queued rather than started, and the queue only
-// advances when the waiting thread yields.
-type coopScheduler struct {
-	queue []func()
+// coopEngine is an Engine modelling a cooperative, single-threaded scheduler
+// like Temporal's deterministic runner: work handed to Go is queued rather than
+// started, and the queue only advances when the runner yields in Await. It
+// exists to prove the Deck performs no blocking operation of its own.
+type coopEngine struct {
+	queue    []func()
+	spawned  int
+	awaitErr error
+	now      func() time.Time
 }
 
-func (c *coopScheduler) spawn(fn func()) {
-	c.queue = append(c.queue, fn)
+func newCoopEngine() *coopEngine { return &coopEngine{} }
+
+func (e *coopEngine) Now() time.Time {
+	if e.now != nil {
+		return e.now()
+	}
+	return time.Now()
 }
 
-func (c *coopScheduler) await(cond func() bool) error {
-	for !cond() {
-		if len(c.queue) == 0 {
+func (e *coopEngine) Spawn(fn func()) deck.Future {
+	return e.enqueue(func() error { fn(); return nil })
+}
+
+func (e *coopEngine) Execute(ctx context.Context, w deck.Work) deck.Future {
+	return e.enqueue(func() error { return w.Local(ctx) })
+}
+
+func (e *coopEngine) enqueue(fn func() error) deck.Future {
+	e.spawned++
+	f := &coopFuture{}
+	e.queue = append(e.queue, func() {
+		f.err = fn()
+		f.ready = true
+	})
+	return f
+}
+
+func (e *coopEngine) Await(_ context.Context, fs []deck.Future) error {
+	if e.awaitErr != nil {
+		return e.awaitErr
+	}
+	for !deck.AnyReady(fs) {
+		if len(e.queue) == 0 {
 			return errors.New("scheduler deadlocked: nothing left to run")
 		}
-		next := c.queue[0]
-		c.queue = c.queue[1:]
+		next := e.queue[0]
+		e.queue = e.queue[1:]
 		next()
 	}
 	return nil
 }
 
+type coopFuture struct {
+	ready bool
+	err   error
+}
+
+func (f *coopFuture) IsReady() bool { return f.ready }
+func (f *coopFuture) Get() error    { return f.err }
+
+// The shape that makes parallelism possible: the Deck must hand every triggered
+// cue to the Engine before waiting on any of them. Assert on the interleaving,
+// not just the results — a Deck that spawned and waited, spawned and waited,
+// would produce the same final state while running everything in series.
 func TestDeck_Run_Await_HandsEveryCueToTheSchedulerBeforeAnyRuns(t *testing.T) {
 	// Given a scheduler that defers spawned work rather than running it
-	sched := &coopScheduler{}
+	sched := newCoopEngine()
 	var log []string
 
 	mkCue := func(name string) deck.Cue[struct{}, TestState] {
@@ -2086,11 +2137,7 @@ func TestDeck_Run_Await_HandsEveryCueToTheSchedulerBeforeAnyRuns(t *testing.T) {
 
 	sut, err := deck.New(mkCue("A"), mkCue("B"), mkCue("C"))
 	require.NoError(t, err)
-	sut.Spawn = func(fn func()) {
-		log = append(log, "spawn")
-		sched.spawn(fn)
-	}
-	sut.Await = sched.await
+	sut.Engine = &loggingEngine{Engine: sched, log: &log}
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2119,9 +2166,9 @@ func TestDeck_Run_Await_SchedulerCancellationSurfacesAsError(t *testing.T) {
 
 	sut, err := deck.New(cue)
 	require.NoError(t, err)
-	sched := &coopScheduler{}
-	sut.Spawn = sched.spawn
-	sut.Await = func(cond func() bool) error { return errors.New("workflow canceled") }
+	sched := newCoopEngine()
+	sched.awaitErr = errors.New("workflow canceled")
+	sut.Engine = sched
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2132,11 +2179,15 @@ func TestDeck_Run_Await_SchedulerCancellationSurfacesAsError(t *testing.T) {
 	// Then the scheduler's error is surfaced and state is not copied back,
 	// with the cue still sitting unrun in the scheduler's queue
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "aborted by Await: workflow canceled")
+	assert.Contains(t, err.Error(), "deck run aborted: workflow canceled")
 	assert.Equal(t, 42, state.Count)
 	assert.Len(t, sched.queue, 1)
 }
 
+// Cancelling a run abandons the cues still in flight, and they have to finish
+// and exit rather than parking forever on a result nobody will collect. This
+// leaked once. Nothing about a leaked goroutine shows up in an ordinary
+// assertion, so they are counted directly.
 func TestDeck_Run_Cancellation_DoesNotLeakCueGoroutines(t *testing.T) {
 	// Given cues that block until released, each abandoned by a cancelled run
 	const runs = 20
@@ -2195,7 +2246,7 @@ func cueGoroutines(testName string) int {
 
 func TestDeck_Run_Await_DrainsRemainingCuesThroughTheScheduler(t *testing.T) {
 	// Given one cue that suspends the run while another is still queued
-	sched := &coopScheduler{}
+	sched := newCoopEngine()
 
 	suspendCue := deck.Cue[struct{}, TestState]{
 		Name: "Suspender",
@@ -2212,8 +2263,7 @@ func TestDeck_Run_Await_DrainsRemainingCuesThroughTheScheduler(t *testing.T) {
 
 	sut, err := deck.New(suspendCue, otherCue)
 	require.NoError(t, err)
-	sut.Spawn = sched.spawn
-	sut.Await = sched.await
+	sut.Engine = sched
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2251,7 +2301,7 @@ func TestDeck_Run_SerialSpawn_RunsDependentCuesAcrossCycles(t *testing.T) {
 
 	sut, err := deck.New(mkCue("C", "B"), mkCue("A", ""), mkCue("B", "A"))
 	require.NoError(t, err)
-	sut.Spawn = func(fn func()) { fn() }
+	sut.Engine = deck.Serial()
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2269,7 +2319,7 @@ func TestDeck_Run_SerialSpawn_RunsDependentCuesAcrossCycles(t *testing.T) {
 
 func TestDeck_Run_Await_RunsDependentCuesAcrossCycles(t *testing.T) {
 	// Given the same chain, driven by a cooperative scheduler
-	sched := &coopScheduler{}
+	sched := newCoopEngine()
 	var order []string
 	mkCue := func(name, needs string) deck.Cue[struct{}, TestState] {
 		return deck.Cue[struct{}, TestState]{
@@ -2286,8 +2336,7 @@ func TestDeck_Run_Await_RunsDependentCuesAcrossCycles(t *testing.T) {
 
 	sut, err := deck.New(mkCue("C", "B"), mkCue("A", ""), mkCue("B", "A"))
 	require.NoError(t, err)
-	sut.Spawn = sched.spawn
-	sut.Await = sched.await
+	sut.Engine = sched
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2314,7 +2363,7 @@ func TestDeck_Run_SerialSpawn_SurfacesCueErrorAndDiscardsItsMutation(t *testing.
 
 	sut, err := deck.New(boom)
 	require.NoError(t, err)
-	sut.Spawn = func(fn func()) { fn() }
+	sut.Engine = deck.Serial()
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2331,7 +2380,7 @@ func TestDeck_Run_SerialSpawn_SurfacesCueErrorAndDiscardsItsMutation(t *testing.
 
 func TestDeck_Run_Await_SurfacesCueErrorAndDiscardsItsMutation(t *testing.T) {
 	// Given the same failing cue, run through a cooperative scheduler
-	sched := &coopScheduler{}
+	sched := newCoopEngine()
 	boom := deck.Cue[struct{}, TestState]{
 		Name: "Boom",
 		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
@@ -2341,8 +2390,7 @@ func TestDeck_Run_Await_SurfacesCueErrorAndDiscardsItsMutation(t *testing.T) {
 
 	sut, err := deck.New(boom)
 	require.NoError(t, err)
-	sut.Spawn = sched.spawn
-	sut.Await = sched.await
+	sut.Engine = sched
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2378,7 +2426,7 @@ func TestDeck_Run_SerialSpawn_SuspendsExportsAndResumes(t *testing.T) {
 
 	sut, err := deck.New(submit, collect)
 	require.NoError(t, err)
-	sut.Spawn = func(fn func()) { fn() }
+	sut.Engine = deck.Serial()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -2405,6 +2453,11 @@ func TestDeck_Run_SerialSpawn_SuspendsExportsAndResumes(t *testing.T) {
 	assert.Equal(t, 2, resumedState.Count)
 }
 
+// Guards the one failure the Deck cannot rescue itself from. Under a serial
+// Engine every cue completes before anything collects the results, so if the
+// Engine could not hold them all the run would wedge inside trigger — before
+// any context is consulted. Hence runBounded: five seconds and a clear message,
+// rather than the package timing out after ten minutes with a goroutine dump.
 func TestDeck_Run_SerialSpawn_DoesNotDeadlockWhenEveryCueTriggersAtOnce(t *testing.T) {
 	// Given many cues that all trigger in one cycle. A serial Spawn delivers
 	// every result before anything receives, so the buffer must hold them all
@@ -2422,7 +2475,7 @@ func TestDeck_Run_SerialSpawn_DoesNotDeadlockWhenEveryCueTriggersAtOnce(t *testi
 
 	sut, err := deck.New(cues...)
 	require.NoError(t, err)
-	sut.Spawn = func(fn func()) { fn() }
+	sut.Engine = deck.Serial()
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -2434,10 +2487,15 @@ func TestDeck_Run_SerialSpawn_DoesNotDeadlockWhenEveryCueTriggersAtOnce(t *testi
 	assert.Len(t, result.CompletedCues, cueCount)
 }
 
+// An Engine that reports success with nothing ready is broken, but the failure
+// mode matters more than the cause: the Deck would park on a receive that no
+// context can reach, and inside a workflow engine that is a permanently stuck
+// run with nothing in the logs to explain it. A named error costs one line and
+// turns that into something diagnosable.
 func TestDeck_Run_Await_ReturningWithoutAResultFailsRatherThanBlocking(t *testing.T) {
 	// Given a scheduler whose Await returns without a result being ready — a
 	// broken adapter
-	sched := &coopScheduler{}
+	sched := newCoopEngine()
 	cue := deck.Cue[struct{}, TestState]{
 		Name: "C",
 		Run: func(_ struct{}, s TestState) (deck.Mutation[TestState], error) {
@@ -2447,8 +2505,7 @@ func TestDeck_Run_Await_ReturningWithoutAResultFailsRatherThanBlocking(t *testin
 
 	sut, err := deck.New(cue)
 	require.NoError(t, err)
-	sut.Spawn = sched.spawn
-	sut.Await = func(cond func() bool) error { return nil }
+	sut.Engine = &spuriousAwaitEngine{Engine: sched}
 
 	// When the deck runs under a context that would normally rescue it
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -2458,10 +2515,18 @@ func TestDeck_Run_Await_ReturningWithoutAResultFailsRatherThanBlocking(t *testin
 
 	// Then Run fails with a diagnosable error instead of blocking forever
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "Await returned")
+	assert.Contains(t, err.Error(), "stalled")
 }
 
-func TestDeck_Run_HooksMayBeReassignedAfterAnAbandonedRun(t *testing.T) {
+// A cancelled run returns while its cues are still executing. Those cues keep
+// reading whatever the Engine gave them — the clock, in this case — so if the
+// runner read Deck.Engine live, a caller setting up their next run would race
+// with a cue from the last one. The runner takes its own copy of the Engine at
+// the start of each run, which is what makes the reassignment below safe.
+//
+// Only -race can fail this: without it the reassignment and the read simply
+// interleave harmlessly. CI runs -race.
+func TestDeck_Run_EngineMayBeReassignedWhileAnAbandonedCueStillRuns(t *testing.T) {
 	// Given a cue still running after its run was cancelled
 	started := make(chan struct{})
 	cue := deck.Cue[struct{}, TestState]{
@@ -2474,7 +2539,7 @@ func TestDeck_Run_HooksMayBeReassignedAfterAnAbandonedRun(t *testing.T) {
 	}
 	sut, err := deck.New(cue)
 	require.NoError(t, err)
-	sut.Now = time.Now
+	sut.Engine = deck.Goroutines()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -2486,7 +2551,7 @@ func TestDeck_Run_HooksMayBeReassignedAfterAnAbandonedRun(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 
 	// When a hook is reassigned for the next run while that cue is still live
-	sut.Now = func() time.Time { return time.Unix(0, 0) }
+	sut.Engine = deck.WithClock(deck.Goroutines(), func() time.Time { return time.Unix(0, 0) })
 
 	// Then the lingering cue finishes without racing on the hook — the run
 	// took its own copy when it started (-race would report otherwise)
@@ -2497,7 +2562,7 @@ func TestDeck_Run_Await_CueErrorSurvivesAnAbortedDrain(t *testing.T) {
 	// Given one cue that fails while another is still queued, and a
 	// scheduler that is cancelled during the drain
 	boom := errors.New("boom")
-	sched := &coopScheduler{}
+	sched := newCoopEngine()
 	failing := deck.Cue[struct{}, TestState]{
 		Name: "Failing",
 		Run:  func(_ struct{}, s TestState) (deck.Mutation[TestState], error) { return nil, boom },
@@ -2510,15 +2575,7 @@ func TestDeck_Run_Await_CueErrorSurvivesAnAbortedDrain(t *testing.T) {
 	}
 	sut, err := deck.New(failing, queued)
 	require.NoError(t, err)
-	sut.Spawn = sched.spawn
-	awaits := 0
-	sut.Await = func(cond func() bool) error {
-		awaits++
-		if awaits == 1 {
-			return sched.await(cond)
-		}
-		return errors.New("workflow canceled")
-	}
+	sut.Engine = &failAfterEngine{Engine: sched, after: 1, err: errors.New("workflow canceled")}
 
 	// When the deck runs
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -2530,4 +2587,753 @@ func TestDeck_Run_Await_CueErrorSurvivesAnAbortedDrain(t *testing.T) {
 	require.ErrorIs(t, err, boom)
 	assert.Contains(t, err.Error(), "workflow canceled")
 	assert.False(t, result.Suspended)
+}
+
+// loggingEngine records a marker each time work is handed to the engine, so a
+// test can see how many cues were started before any of them ran.
+type loggingEngine struct {
+	deck.Engine
+	log *[]string
+}
+
+func (e *loggingEngine) Spawn(fn func()) deck.Future {
+	*e.log = append(*e.log, "spawn")
+	return e.Engine.Spawn(fn)
+}
+
+// spuriousAwaitEngine reports success from Await without anything being ready —
+// a broken engine.
+type spuriousAwaitEngine struct{ deck.Engine }
+
+func (e *spuriousAwaitEngine) Await(context.Context, []deck.Future) error { return nil }
+
+// failAfterEngine yields normally, then fails — an engine cancelled partway
+// through a run.
+type failAfterEngine struct {
+	deck.Engine
+	after int
+	err   error
+	calls int
+}
+
+func (e *failAfterEngine) Await(ctx context.Context, fs []deck.Future) error {
+	e.calls++
+	if e.calls > e.after {
+		return e.err
+	}
+	return e.Engine.Await(ctx, fs) //nolint:wrapcheck // delegating to the wrapped engine
+}
+
+// --- Declared work ---
+
+// slowValue is an ordinary Go function: the shape a cue declares with Do, and
+// the shape a durable engine would register as an activity.
+func slowValue(ctx context.Context, name string) (string, error) {
+	select {
+	case <-time.After(50 * time.Millisecond):
+	case <-ctx.Done():
+		return "", fmt.Errorf("slowValue cancelled: %w", ctx.Err())
+	}
+	return "value:" + name, nil
+}
+
+type workState struct {
+	Values []string
+	Starts map[string]time.Time
+	Ends   map[string]time.Time
+}
+
+func TestDeck_Run_Do_RunsDeclaredWorkConcurrently(t *testing.T) {
+	// Given two cues that declare work rather than doing it themselves
+	var mu sync.Mutex
+	starts, ends := map[string]time.Time{}, map[string]time.Time{}
+	timed := func(ctx context.Context, name string) (string, error) {
+		mu.Lock()
+		starts[name] = time.Now()
+		mu.Unlock()
+		v, err := slowValue(ctx, name)
+		mu.Lock()
+		ends[name] = time.Now()
+		mu.Unlock()
+		return v, err
+	}
+
+	mkCue := func(name string) deck.Cue[struct{}, workState] {
+		return deck.Cue[struct{}, workState]{
+			Name: name,
+			Run: func(_ struct{}, _ workState) (deck.Mutation[workState], error) {
+				return deck.Do(timed, name, func(v string) deck.Mutation[workState] {
+					return deck.Complete(func(s *workState) { s.Values = append(s.Values, v) })
+				}), nil
+			},
+		}
+	}
+
+	sut, err := deck.New(mkCue("a"), mkCue("b"))
+	require.NoError(t, err)
+
+	// When the deck runs on the default engine
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state := &workState{}
+	result, err := sut.Run(ctx, struct{}{}, state)
+
+	// Then both results reached state, and the two units of work overlapped
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"value:a", "value:b"}, state.Values)
+	assert.Len(t, result.CompletedCues, 2)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.True(t, starts["a"].Before(ends["b"]) && starts["b"].Before(ends["a"]),
+		"declared work should have run concurrently")
+}
+
+func TestDeck_Run_Do_UnderSerialEngine_RunsWorkInlineInOrder(t *testing.T) {
+	// Given the same shape of cue on the serial engine
+	var order []string
+	record := func(_ context.Context, name string) (string, error) {
+		order = append(order, name)
+		return "value:" + name, nil
+	}
+
+	mkCue := func(name string) deck.Cue[struct{}, workState] {
+		return deck.Cue[struct{}, workState]{
+			Name: name,
+			Run: func(_ struct{}, _ workState) (deck.Mutation[workState], error) {
+				return deck.Do(record, name, func(v string) deck.Mutation[workState] {
+					return deck.Complete(func(s *workState) { s.Values = append(s.Values, v) })
+				}), nil
+			},
+		}
+	}
+
+	sut, err := deck.New(mkCue("a"), mkCue("b"), mkCue("c"))
+	require.NoError(t, err)
+	sut.Engine = deck.Serial()
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	state := &workState{}
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
+
+	// Then the work ran inline, in order, with no concurrency at all
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b", "c"}, order)
+	assert.Equal(t, []string{"value:a", "value:b", "value:c"}, state.Values)
+	assert.Len(t, result.CompletedCues, 3)
+}
+
+func TestDeck_Run_Do_WorkErrorFailsTheCue(t *testing.T) {
+	// Given a cue whose declared work fails
+	boom := errors.New("boom")
+	failing := func(_ context.Context, name string) (string, error) { return "", boom }
+
+	cue := deck.Cue[struct{}, workState]{
+		Name: "Failing",
+		Run: func(_ struct{}, _ workState) (deck.Mutation[workState], error) {
+			return deck.Do(failing, "x", func(v string) deck.Mutation[workState] {
+				return deck.Complete(func(s *workState) { s.Values = append(s.Values, v) })
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(cue)
+	require.NoError(t, err)
+	sut.Engine = deck.Serial()
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	state := &workState{}
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
+
+	// Then the failure is reported against the cue, and nothing was applied
+	require.ErrorIs(t, err, boom)
+	assert.Contains(t, err.Error(), "cue Failing")
+	assert.False(t, result.Completed("Failing"))
+	assert.Empty(t, state.Values)
+}
+
+// captureEngine records the Work it is handed, so a test can see what an
+// engine has to go on when it decides how to perform it.
+type captureEngine struct {
+	deck.Engine
+	works []deck.Work
+}
+
+func (e *captureEngine) Execute(ctx context.Context, w deck.Work) deck.Future {
+	e.works = append(e.works, w)
+	return e.Engine.Execute(ctx, w) //nolint:wrapcheck // delegating to the wrapped engine
+}
+
+// CueName is what lets an Engine treat one cue's work differently from
+// another's without the cue knowing anything about the Engine — it is what
+// decktemporal.ForCue is built on. Cheap to break by accident when the runner
+// changes, and nothing else in the core would notice.
+func TestDeck_Run_Do_TellsTheEngineWhichCueDeclaredTheWork(t *testing.T) {
+	// Given cues that declare work, on an engine that inspects it
+	mkCue := func(name string) deck.Cue[struct{}, workState] {
+		return deck.Cue[struct{}, workState]{
+			Name: name,
+			Run: func(_ struct{}, _ workState) (deck.Mutation[workState], error) {
+				return deck.Do(slowValue, name, func(v string) deck.Mutation[workState] {
+					return deck.Complete(func(s *workState) { s.Values = append(s.Values, v) })
+				}), nil
+			},
+		}
+	}
+
+	engine := &captureEngine{Engine: deck.Serial()}
+	sut, err := deck.New(mkCue("alpha"), mkCue("beta"))
+	require.NoError(t, err)
+	sut.Engine = engine
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = runBounded(t, sut, ctx, struct{}{}, &workState{})
+	require.NoError(t, err)
+
+	// Then each unit of work names the cue that declared it, so an engine can
+	// treat one cue's work differently from another's
+	require.Len(t, engine.works, 2)
+	assert.Equal(t, "alpha", engine.works[0].CueName)
+	assert.Equal(t, "beta", engine.works[1].CueName)
+}
+
+// whenAnyEngine models an engine whose only waiting primitive is "block until
+// one of these handles is done" — the shape durable-execution engines other
+// than Temporal tend to offer. It is never handed a predicate, only the
+// futures, so it can only be written if Await says what it is waiting on.
+type whenAnyEngine struct {
+	queue []func()
+}
+
+func (e *whenAnyEngine) Now() time.Time { return time.Now() }
+
+func (e *whenAnyEngine) Spawn(fn func()) deck.Future {
+	return e.enqueue(func() error { fn(); return nil })
+}
+
+func (e *whenAnyEngine) Execute(ctx context.Context, w deck.Work) deck.Future {
+	return e.enqueue(func() error { return w.Local(ctx) })
+}
+
+func (e *whenAnyEngine) enqueue(fn func() error) deck.Future {
+	f := &coopFuture{}
+	e.queue = append(e.queue, func() {
+		f.err = fn()
+		f.ready = true
+	})
+	return f
+}
+
+func (e *whenAnyEngine) Await(_ context.Context, fs []deck.Future) error {
+	for !deck.AnyReady(fs) {
+		if len(e.queue) == 0 {
+			return errors.New("nothing left to run")
+		}
+		next := e.queue[0]
+		e.queue = e.queue[1:]
+		next()
+	}
+	return nil
+}
+
+func TestDeck_Run_EngineThatCanOnlyWaitOnHandles(t *testing.T) {
+	// Given cues that declare work, and an engine with no way to evaluate a
+	// condition — it can only be told which handles to wait on
+	mkCue := func(name, needs string) deck.Cue[struct{}, workState] {
+		c := deck.Cue[struct{}, workState]{
+			Name: name,
+			Run: func(_ struct{}, _ workState) (deck.Mutation[workState], error) {
+				return deck.Do(slowValue, name, func(v string) deck.Mutation[workState] {
+					return deck.Complete(func(s *workState) { s.Values = append(s.Values, v) })
+				}), nil
+			},
+		}
+		if needs != "" {
+			c.When = func(_ struct{}, _ workState, r deck.Result) bool { return r.Completed(needs) }
+		}
+		return c
+	}
+
+	sut, err := deck.New(mkCue("a", ""), mkCue("b", ""), mkCue("c", "a"))
+	require.NoError(t, err)
+	sut.Engine = &whenAnyEngine{}
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state := &workState{}
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
+
+	// Then it completes exactly as it would on any other engine
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"value:a", "value:b", "value:c"}, state.Values)
+	assert.Len(t, result.CompletedCues, 3)
+}
+
+// This guards the mistake a Temporal user is most likely to make. The natural
+// way to write a workflow is to build the Deck once, at package level, and give
+// each workflow its own Engine:
+//
+//	var flowDeck, _ = deck.New(cues...)
+//
+//	func MyWorkflow(ctx workflow.Context) error {
+//		flowDeck.Engine = temporal.New(ctx)   // <-- data race
+//		...
+//	}
+//
+// That assignment looks harmless and is not: one worker runs many workflows at
+// a time, so every one of them writes that single field while the others are
+// reading it. WithEngine exists so the obvious spelling is also the safe one,
+// and this test is the reason it cannot quietly go back to assigning in place.
+//
+// It fails in two independent ways if WithEngine ever stops copying, which is
+// deliberate:
+//
+//   - under -race, the detector fires on the concurrent writes (CI runs -race)
+//   - without -race, the final assertion still catches it, because a
+//     non-copying WithEngine leaves its last Engine behind on the shared Deck
+func TestDeck_WithEngine_LetsOneDeckServeConcurrentRuns(t *testing.T) {
+	// Given one Deck built once and shared, as a package-level Deck would be
+	var cues []deck.Cue[struct{}, TestState]
+	for i := range 4 {
+		cues = append(cues, deck.Cue[struct{}, TestState]{
+			Name: string(rune('a' + i)),
+			Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+				return deck.Complete(func(s *TestState) { s.Count++ }), nil
+			},
+		})
+	}
+	sut, err := deck.New(cues...)
+	require.NoError(t, err)
+
+	// When many runs go at once, each choosing its own engine. They alternate
+	// between two engines on purpose: if every run wrote the same value, an
+	// in-place assignment could look correct by luck.
+	var wg sync.WaitGroup
+	for i := range 8 {
+		engine := deck.Goroutines()
+		if i%2 == 0 {
+			engine = deck.Serial()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			// Each run gets its own Deck, so there is nothing shared to write
+			// to. Every run must still see all four cues complete — proof that
+			// the copy kept the cues and only swapped the engine.
+			state := &TestState{}
+			_, runErr := sut.WithEngine(engine).Run(ctx, struct{}{}, state)
+			assert.NoError(t, runErr)
+			assert.Equal(t, 4, state.Count)
+		}()
+	}
+	wg.Wait()
+
+	// Then the shared Deck is exactly as New left it. Nothing wrote to it, so
+	// there was nothing to race on.
+	assert.Nil(t, sut.Engine, "WithEngine must copy the Deck, not modify it")
+}
+
+// --- Panics in user code ---
+
+// A cue is user code, often calling further user code, so it can panic. Deck
+// turns that into the cue error it already has a path for, rather than letting
+// it surface differently under each Engine — under the default one it would run
+// on a goroutine deck created, ending the process with the caller unable to
+// intervene.
+//
+// These three tests cover the three places deck calls into user code, and each
+// runs across the whole table, because behaving the same everywhere is the
+// point.
+
+func TestDeck_Run_PanicInCueRunBecomesACueError(t *testing.T) {
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given a cue whose Run panics
+			cue := deck.Cue[struct{}, TestState]{
+				Name: "Boom",
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					panic("cue exploded")
+				},
+			}
+			sut, err := deck.New(cue)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			// When the deck runs
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			state := &TestState{Count: 7}
+			result, err := runBounded(t, sut, ctx, struct{}{}, state)
+
+			// Then the run fails, naming the cue and carrying the panic and a
+			// stack trace — without which a recovered panic is far harder to
+			// chase than the crash it replaced
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cue Boom")
+			assert.Contains(t, err.Error(), "cue exploded")
+			assert.Contains(t, err.Error(), "goroutine")
+			assert.False(t, result.Completed("Boom"))
+			assert.Equal(t, 7, state.Count, "state should not be copied back")
+		})
+	}
+}
+
+func TestDeck_Run_PanicInDeclaredWorkBecomesACueError(t *testing.T) {
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given work declared with Do that panics when the Engine runs it
+			exploding := func(_ context.Context, _ string) (string, error) {
+				panic("work exploded")
+			}
+			cue := deck.Cue[struct{}, TestState]{
+				Name: "Boom",
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Do(exploding, "x", func(string) deck.Mutation[TestState] {
+						return deck.Complete(func(s *TestState) { s.Count = 99 })
+					}), nil
+				},
+			}
+			sut, err := deck.New(cue)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			// When the deck runs
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			state := &TestState{Count: 7}
+			_, err = runBounded(t, sut, ctx, struct{}{}, state)
+
+			// Then it fails the same way as a panic in Run
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cue Boom")
+			assert.Contains(t, err.Error(), "work exploded")
+			assert.Equal(t, 7, state.Count)
+		})
+	}
+}
+
+func TestDeck_Run_PanicInResultHandlerBecomesACueError(t *testing.T) {
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given work that succeeds but whose result handler panics. That
+			// handler runs on deck's own goroutine rather than the Engine's, so
+			// it is a separate path from the two above.
+			cue := deck.Cue[struct{}, TestState]{
+				Name: "Boom",
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Do(slowValue, "x", func(string) deck.Mutation[TestState] {
+						panic("handler exploded")
+					}), nil
+				},
+			}
+			sut, err := deck.New(cue)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			// When the deck runs
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			state := &TestState{Count: 7}
+			_, err = runBounded(t, sut, ctx, struct{}{}, state)
+
+			// Then it fails the same way again
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cue Boom")
+			assert.Contains(t, err.Error(), "handler exploded")
+			assert.Equal(t, 7, state.Count)
+		})
+	}
+}
+
+// The runner costs O(n²) in the number of cues triggered at once: each absorbed
+// cue rebuilds the list of outstanding futures, scans it twice, and removes
+// from the middle of a slice. Measured, doubling the cues roughly doubles the
+// per-cue cost — 1,000 cues take ~5ms, 8,000 take ~236ms.
+//
+// That is left alone deliberately. Realistic flows have tens of cues, where the
+// cost is microseconds, and the loop is the one place determinism matters most,
+// so it is not worth complicating to serve a size nobody has. This test exists
+// to catch a change that makes it dramatically worse, not to assert a big-O:
+// the bound is loose enough to be stable on a busy machine and tight enough
+// that another factor of n would blow it.
+func TestDeck_Run_HandlesALargeFanOut(t *testing.T) {
+	// Given a thousand cues that all trigger in the same cycle
+	const cueCount = 1000
+	var cues []deck.Cue[struct{}, TestState]
+	for i := range cueCount {
+		cues = append(cues, deck.Cue[struct{}, TestState]{
+			Name: fmt.Sprintf("cue%d", i),
+			Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+				return deck.Complete(func(s *TestState) { s.Count++ }), nil
+			},
+		})
+	}
+	sut, err := deck.New(cues...)
+	require.NoError(t, err)
+	sut.Engine = deck.Serial()
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	state := &TestState{}
+	start := time.Now()
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
+	elapsed := time.Since(start)
+
+	// Then every cue completed, in a time that stays sane at this size
+	require.NoError(t, err)
+	assert.Equal(t, cueCount, state.Count)
+	assert.Len(t, result.CompletedCues, cueCount)
+	t.Logf("%d cues in %v (%v per cue)", cueCount, elapsed.Round(time.Millisecond), elapsed/cueCount)
+	assert.Less(t, elapsed, 2*time.Second, "a thousand cues should not take seconds")
+}
+
+// Goroutines() documents that an Engine may be shared between concurrent runs,
+// so it has to actually be true. The engine wakes waiting runs when a cue
+// finishes; if it signalled only one of them, a run whose own cue was still
+// going could take the nudge meant for another, and that other run would wait
+// for a wakeup already consumed.
+//
+// The shape matters for catching it reliably. A single-slot signal goes to
+// whichever run has waited longest — the slow one, parked first — so it
+// swallows every fast completion and is never woken by its own. That surfaces
+// as the slow run failing on its context deadline, which is what catches the
+// regression; the elapsed-time check below is the property being protected.
+//
+// Every other test builds an engine per run, which is why none of them caught
+// this.
+func TestDeck_Run_OneEngineSharedBetweenConcurrentRuns(t *testing.T) {
+	shared := deck.Goroutines()
+	const fast, slow = 100 * time.Millisecond, 500 * time.Millisecond
+
+	newRun := func(d time.Duration) *deck.Deck[struct{}, TestState] {
+		cue := deck.Cue[struct{}, TestState]{
+			Name: "work",
+			Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+				time.Sleep(d)
+				return deck.Complete(func(s *TestState) { s.Count++ }), nil
+			},
+		}
+		sut, err := deck.New(cue)
+		require.NoError(t, err)
+		sut.Engine = shared
+		return sut
+	}
+
+	// Decks are built here, on the test goroutine, so a failure in New reports
+	// cleanly rather than from inside a worker.
+	durations := []time.Duration{slow, fast, fast, fast}
+	decks := make([]*deck.Deck[struct{}, TestState], len(durations))
+	for i, d := range durations {
+		decks[i] = newRun(d)
+	}
+
+	// When the slow run is parked first and three fast runs join it
+	took := make([]time.Duration, len(decks))
+	errs := make([]error, len(decks))
+	var wg sync.WaitGroup
+	for i := range decks {
+		if i == 1 {
+			time.Sleep(50 * time.Millisecond) // let the slow run reach Await
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			start := time.Now()
+			_, err := decks[i].Run(ctx, struct{}{}, &TestState{})
+			took[i], errs[i] = time.Since(start), err
+		}()
+	}
+	wg.Wait()
+
+	// Then every run finishes on its own schedule, none waiting on another
+	for i, d := range durations {
+		//nolint:testifylint // the runs are independent; report every one
+		assert.NoErrorf(t, errs[i], "run %d (%v cue)", i, d)
+		t.Logf("run %d (%v cue) took %v", i, d, took[i].Round(10*time.Millisecond))
+		if d == fast {
+			assert.Lessf(t, took[i], 3*fast, "run %d: a fast run waited on another run", i)
+		}
+	}
+}
+
+// Draining lets cues in flight finish. A cue whose Run declared work with Do
+// has not started that work yet, though — the Engine starts it when the Deck
+// absorbs the cue — so draining must not absorb one, or a failing run would
+// begin a fresh HTTP call, or schedule a new activity, after deciding to abort.
+//
+// Serial ordering makes it deterministic: "explode" is registered first, so its
+// error lands before "worker" is reached in the drain.
+func TestDeck_Run_DoesNotStartDeclaredWorkAfterAnError(t *testing.T) {
+	// Given a cue that fails, and a sibling that declared work
+	boom := errors.New("boom")
+	var mu sync.Mutex
+	workRan := false
+	work := func(_ context.Context, _ string) (string, error) {
+		mu.Lock()
+		workRan = true
+		mu.Unlock()
+		return "done", nil
+	}
+
+	exploding := deck.Cue[struct{}, TestState]{
+		Name: "explode",
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return nil, boom
+		},
+	}
+	worker := deck.Cue[struct{}, TestState]{
+		Name: "worker",
+		Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+			return deck.Do(work, "x", func(string) deck.Mutation[TestState] {
+				return deck.Complete(func(s *TestState) { s.Count++ })
+			}), nil
+		},
+	}
+
+	sut, err := deck.New(exploding, worker)
+	require.NoError(t, err)
+	sut.Engine = deck.Serial()
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	state := &TestState{}
+	_, err = runBounded(t, sut, ctx, struct{}{}, state)
+
+	// Then the run fails on the first cue, and the sibling's work never starts
+	require.ErrorIs(t, err, boom)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.False(t, workRan, "declared work must not start once the run is failing")
+}
+
+// Suspending is a pause, not a failure: the run's state is about to be exported
+// and resumed, so a sibling that declared work must still finish and be
+// recorded, or its result is missing from the snapshot. That matters most when
+// the suspending cue's own mutation changes what the sibling's When sees — as
+// here, where a resumed run would no longer trigger it, and the work would be
+// lost with nothing in Result to say so.
+//
+// Runs under every engine because the outcome must not depend on which cue the
+// engine happens to absorb first. Under Serial the suspension always lands
+// before the sibling is reached; under Goroutines either order can happen.
+func TestDeck_Run_SuspendStillCompletesASiblingsDeclaredWork(t *testing.T) {
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given a cue that suspends and flips state, and a sibling that
+			// declared work and only triggers on the state before the flip
+			var mu sync.Mutex
+			workRan := false
+			work := func(_ context.Context, _ string) (rune, error) {
+				mu.Lock()
+				workRan = true
+				mu.Unlock()
+				return 'w', nil
+			}
+
+			suspender := deck.Cue[struct{}, TestState]{
+				Name: "suspender",
+				When: func(_ struct{}, s TestState, _ deck.Result) bool { return s.Count == 0 },
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Suspended(func(s *TestState) { s.Count = 1 }), nil
+				},
+			}
+			worker := deck.Cue[struct{}, TestState]{
+				Name: "worker",
+				When: func(_ struct{}, s TestState, _ deck.Result) bool { return s.Count == 0 },
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Do(work, "x", func(r rune) deck.Mutation[TestState] {
+						return deck.Complete(func(s *TestState) { s.Buffer = append(s.Buffer, r) })
+					}), nil
+				},
+			}
+
+			sut, err := deck.New(suspender, worker)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			// When the deck runs and suspends
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			state := &TestState{}
+			result, err := runBounded(t, sut, ctx, struct{}{}, state)
+
+			// Then the sibling's work ran and it is recorded, so the snapshot
+			// is whole
+			require.NoError(t, err)
+			assert.True(t, result.Suspended)
+			mu.Lock()
+			assert.True(t, workRan, "declared work must still run when the run is only suspending")
+			mu.Unlock()
+			assert.True(t, result.Completed("worker"))
+			assert.Equal(t, []rune{'w'}, state.Buffer)
+		})
+	}
+}
+
+// Do's handler returns a Mutation, so it may return another Do — the natural
+// way to write "call again until it is ready". Left unchecked, each collected
+// result starts the next round and a suspending run never finishes draining.
+// What the cue's own Run declared still runs, so the snapshot stays whole.
+func TestDeck_Run_SuspendStopsWorkChainedFromAHandler(t *testing.T) {
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given a cue that keeps declaring more work from its own handler
+			var rounds atomic.Int64
+			work := func(_ context.Context, _ string) (string, error) {
+				rounds.Add(1)
+				return "v", nil
+			}
+			var chain func(string) deck.Mutation[TestState]
+			chain = func(string) deck.Mutation[TestState] {
+				if rounds.Load() >= 20 { // a cap, so a failure reports rather than hangs
+					return deck.Complete(func(s *TestState) { s.Count = -1 })
+				}
+				return deck.Do(work, "x", chain)
+			}
+
+			poller := deck.Cue[struct{}, TestState]{
+				Name: "poller",
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Do(work, "x", chain), nil
+				},
+			}
+			suspender := deck.Cue[struct{}, TestState]{
+				Name: "suspender",
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Suspended(func(s *TestState) { s.Count = 1 }), nil
+				},
+			}
+
+			sut, err := deck.New(suspender, poller)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			// When a sibling suspends the run
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			result, err := runBounded(t, sut, ctx, struct{}{}, &TestState{})
+
+			// Then the work its Run declared ran, and the chain stopped there
+			require.NoError(t, err)
+			assert.True(t, result.Suspended)
+			assert.Equal(t, int64(1), rounds.Load(),
+				"the handler's next round must not start once the run is suspending")
+			assert.False(t, result.Completed("poller"), "the cue did not finish")
+		})
+	}
 }

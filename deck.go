@@ -32,6 +32,39 @@
 // Do not put functions, clients, or other behavior in I. Inject those via
 // closures over Cue.Run.
 //
+// # Where cues run
+//
+// A Deck's Engine decides where its cues run. Leave Deck.Engine nil and you
+// get Goroutines: one goroutine per cue and the wall clock. Set it to Serial
+// to run cues one at a time in registration order, which makes a run
+// reproducible, or to an engine of your own — see the deck/temporal module,
+// which runs a Deck inside a Temporal workflow.
+//
+// # Declaring work
+//
+// A Cue's Run may do its work directly and return Complete. Where the work
+// leaves the process, is slow, or is not deterministic, it should instead
+// describe the work with Do and let the Engine perform it:
+//
+//	Run: func(in Input, s State) (deck.Mutation[State], error) {
+//		return deck.Do(FetchUser, in.UserID, func(u User) deck.Mutation[State] {
+//			return deck.Complete(func(s *State) { s.User = u })
+//		}), nil
+//	}
+//
+// Do returns straight away, so the Deck carries on triggering other cues while
+// the work runs. A cue written this way does not know where its work happens,
+// which is what lets the same cues run on goroutines in one process and as
+// durable activities in another.
+//
+// One consequence of not knowing: locally the argument is handed to fn
+// directly, while an engine running the work elsewhere has to serialise it.
+// Unexported fields survive the first and not the second, silently. Keep
+// anything crossing that line to exported fields.
+//
+// Most flows mix the two: cues that fetch or call something use Do, and a cue
+// that merely assembles what they gathered uses Complete.
+//
 // # Suspend and resume
 //
 // A Cue can return Suspended instead of Complete to signal that it has
@@ -44,7 +77,9 @@ package deck
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"runtime/debug"
 	"time"
 )
 
@@ -54,38 +89,37 @@ import (
 // I is the immutable input type; S is the mutable state type. See the package
 // documentation for the full I/S contract.
 //
-// Now, Spawn and Await are optional hooks for running where ordinary Go
-// concurrency is not allowed, such as a durable-execution workflow. Set them
-// before calling Run; each run takes its own copy of them as it starts.
+// Engine decides where cues run. Leave it nil for goroutines and the wall
+// clock; set it to run somewhere ordinary Go concurrency is not allowed.
 type Deck[I, S any] struct {
 	cues []Cue[I, S]
 
-	// Now stamps a cue's start and end times. Nil means time.Now. Inject a
-	// deterministic clock where wall-clock reads are forbidden.
+	// Engine is where this Deck's cues run. Nil means Goroutines.
 	//
-	// Now is called from inside each cue, so unless Spawn is serial it must
-	// be safe for concurrent use. An engine clock that is constant within a
-	// step (Temporal's workflow.Now) yields a zero Duration for cues that
-	// start and end in that step.
-	Now func() time.Time
+	// Assign it only on a Deck you own outright. Where one Deck is shared
+	// between runs that need different engines — a package-level Deck used by
+	// every workflow on a worker, say — use WithEngine instead: assigning here
+	// would race with every other run in flight.
+	Engine Engine
+}
 
-	// Spawn starts a triggered cue and must run the given function exactly
-	// once, now or later. Nil means a goroutine per cue.
-	//
-	// A serial Spawn — one that calls the function inline — gives
-	// deterministic, single-threaded execution. A Spawn that defers to an
-	// engine's scheduler (Temporal's workflow.Go) runs cues concurrently and
-	// must be paired with Await; where the engine hands the scheduled
-	// function its own context, the adapter must pass that on to the cue.
-	Spawn func(func())
-
-	// Await yields to the caller's scheduler until cond returns true, and
-	// aborts the run if it returns an error. Nil means Run blocks on a plain
-	// channel receive. Set it exactly when Spawn defers to an engine's
-	// scheduler, where blocking natively would stall every cue the engine
-	// has yet to run. cond is side-effect free and may be called any number
-	// of times.
-	Await func(cond func() bool) error
+// WithEngine returns a copy of d that runs on e, leaving d untouched. The two
+// share their cues, which are read-only once New has returned.
+//
+// It exists so that a Deck built once can serve many runs at once, each with
+// its own engine:
+//
+//	var flow, _ = deck.New(cues...)   // once, at startup
+//
+//	d := flow.WithEngine(engine)      // per run
+//	_, err := d.Run(ctx, input, &state)
+//
+// Assigning to flow.Engine looks equivalent and races with every other run
+// in flight.
+func (d *Deck[I, S]) WithEngine(e Engine) *Deck[I, S] {
+	c := *d
+	c.Engine = e
+	return &c
 }
 
 // Cue is a single unit of work. The Deck evaluates each pending cue's When
@@ -111,6 +145,10 @@ type Cue[I, S any] struct {
 	// The returned mutation is discarded and the cue is not recorded in
 	// Result.CompletedCues. If multiple concurrent cues error, the first
 	// observed error wins.
+	//
+	// A panic is treated the same way, reported with the panic value and a
+	// stack trace. Work declared with Do, and the handler given to it, are
+	// covered too.
 	Run func(I, S) (Mutation[S], error)
 }
 
@@ -177,6 +215,62 @@ func Complete[S any](fn func(*S)) Mutation[S] {
 func Suspended[S any](fn func(*S)) Mutation[S] {
 	return &suspendedMutation[S]{mutate: fn}
 }
+
+// Do declares work for the Deck's Engine to perform, rather than performing it
+// in the cue. fn is an ordinary Go function; then turns its result into a state
+// update once the work has finished.
+//
+// Use Do where the work leaves the process, is slow, or is not deterministic.
+// A cue that only computes from state it already holds should return Complete
+// instead: it will run inline, and under a durable engine it costs nothing,
+// where a Do would cost a scheduled unit of work and an entry in the run's
+// history.
+//
+// Under the default Engine fn is called on its own goroutine. Under a durable
+// engine it may run in another process entirely, so fn and arg must carry
+// everything the work needs, and the result must survive being serialised.
+func Do[S, A, R any](
+	fn func(context.Context, A) (R, error),
+	arg A,
+	then func(R) Mutation[S],
+) Mutation[S] {
+	var result R
+	return &workMutation[S]{
+		work: Work{
+			Func:   fn,
+			Arg:    arg,
+			Result: &result,
+			Local: func(ctx context.Context) (err error) {
+				// fn is user code, and the Engine may be running it on a
+				// goroutine the caller cannot reach.
+				defer func() {
+					if p := recover(); p != nil {
+						err = panicError(p)
+					}
+				}()
+				out, callErr := fn(ctx, arg)
+				if callErr != nil {
+					return callErr
+				}
+				result = out
+				return nil
+			},
+		},
+		collect: func() Mutation[S] { return then(result) },
+	}
+}
+
+// workMutation is what Do returns. It is not a state change: the runner
+// recognises it, has the Engine perform the work, and applies whatever collect
+// produces once the result arrives.
+type workMutation[S any] struct {
+	work    Work
+	collect func() Mutation[S]
+}
+
+// Never reached: the runner intercepts workMutation before applying anything.
+func (m *workMutation[S]) apply(*S)          {}               //nolint:unused
+func (m *workMutation[S]) isSuspended() bool { return false } //nolint:unused
 
 // CompletedCue records a cue that finished successfully and when its Run
 // started and ended, as read from Deck.Now.
@@ -247,8 +341,12 @@ func (d *Deck[I, S]) Import(data []byte) (*S, Result, error) {
 // more cues trigger, when a cue returns a Suspended mutation, when a cue
 // returns an error, or when the context is cancelled.
 //
-// Cancellation is checked between cycles in every execution mode; only the
-// default mode can additionally abandon cues still in flight.
+// Cancellation is checked between cycles, and again whenever the Engine
+// yields. Only the default Engine can additionally abandon cues in flight.
+//
+// An error beats a suspension: a cue failing during the drain makes Run return
+// that error, with no suspension in the Result and state left as it was. Work
+// already begun still ran, so a resumed run may repeat it.
 //
 // Input is passed by value to every When and Run; the library does not
 // mutate it and cues must not. State is mutated by cues' returned Mutations
@@ -296,64 +394,55 @@ func (d *Deck[I, S]) Run(ctx context.Context, input I, state *S, prev ...Result)
 
 // runner encapsulates the state of a single Deck execution.
 type runner[I, S any] struct {
-	ctx         context.Context
-	input       I
-	state       *S
-	pending     []Cue[I, S]
-	done        chan cueResult[S]
-	activeCount int
-	completed   []CompletedCue
-	suspended   bool
-	runErr      error // first error returned by any cue's Run (subsequent errors are dropped)
-
-	// Hooks resolved at Run start, so a cue that outlives its run never
-	// reads the Deck's fields.
-	clock func() time.Time
-	spawn func(func())
-	await func(func() bool) error
+	ctx       context.Context
+	engine    Engine
+	input     I
+	state     *S
+	pending   []Cue[I, S]
+	inflight  []*attempt[S]
+	completed []CompletedCue
+	suspended bool
+	runErr    error // first error returned by any cue's Run (subsequent errors are dropped)
 }
 
-type cueResult[S any] struct {
-	cueName   string
-	mutation  Mutation[S]
-	err       error
-	startTime time.Time
-	endTime   time.Time
+// attempt is one cue execution in flight. The Engine's Future says when the
+// other fields may be read.
+type attempt[S any] struct {
+	name       string
+	future     Future
+	start, end time.Time
+	mutation   Mutation[S]
+	err        error
+
+	// collect is set on the second phase of a Do cue: the cue's Run has
+	// returned and its declared work is now in flight.
+	collect func() Mutation[S]
 }
 
 func newRunner[I, S any](d *Deck[I, S], ctx context.Context, input I, state *S) *runner[I, S] {
 	pending := make([]Cue[I, S], len(d.cues))
 	copy(pending, d.cues)
 
-	clock := d.Now
-	if clock == nil {
-		clock = time.Now
-	}
-	spawn := d.Spawn
-	if spawn == nil {
-		spawn = func(fn func()) { go fn() }
+	engine := d.Engine
+	if engine == nil {
+		engine = Goroutines()
 	}
 
-	// Buffered so a serial Spawn can deliver inline before any receiver runs.
-	// Each cue runs at most once per Run, so len(cues) is always enough.
 	return &runner[I, S]{
 		ctx:     ctx,
+		engine:  engine,
 		input:   input,
 		state:   state,
 		pending: pending,
-		done:    make(chan cueResult[S], len(d.cues)),
-		clock:   clock,
-		spawn:   spawn,
-		await:   d.Await,
 	}
 }
 
 func (r *runner[I, S]) run() (Result, error) {
 	for {
-		// A non-blocking read, so cancellation is honoured between cycles in
-		// every execution mode.
+		// A non-blocking read, so cancellation is honoured between cycles
+		// whatever the Engine does.
 		if err := r.ctx.Err(); err != nil {
-			return Result{CompletedCues: r.completed, Suspended: r.suspended}, fmt.Errorf("deck run cancelled: %w", err)
+			return r.result(), fmt.Errorf("deck run cancelled: %w", err)
 		}
 
 		hits, misses := r.check()
@@ -361,18 +450,17 @@ func (r *runner[I, S]) run() (Result, error) {
 		r.trigger(hits)
 
 		if r.isStable() {
-			return Result{CompletedCues: r.completed, Suspended: r.suspended}, r.runErr
+			return r.result(), r.runErr
 		}
 
 		if err := r.wait(); err != nil {
-			return Result{CompletedCues: r.completed, Suspended: r.suspended}, err
+			return r.result(), err
 		}
 
-		// Either condition stops the run: drain remaining active cues so
-		// their goroutines can exit cleanly, then decide what to return.
-		// Error takes precedence over suspended — the drain itself may have
-		// captured an error from a sibling cue, so we re-check r.runErr
-		// AFTER drain rather than only before.
+		// Either condition stops the run: drain the cues still in flight so
+		// they finish cleanly, then decide what to return. Error takes
+		// precedence over suspended — the drain itself may have captured an
+		// error from a sibling cue, so we re-check r.runErr AFTER draining.
 		if r.suspended || r.runErr != nil {
 			drainErr := r.drain()
 			switch {
@@ -381,23 +469,25 @@ func (r *runner[I, S]) run() (Result, error) {
 			case r.runErr != nil:
 				return Result{CompletedCues: r.completed}, r.runErr
 			case drainErr != nil:
-				return Result{CompletedCues: r.completed, Suspended: r.suspended}, drainErr
+				return r.result(), drainErr
 			}
 			return Result{CompletedCues: r.completed, Suspended: true}, nil
 		}
 	}
 }
 
+func (r *runner[I, S]) result() Result {
+	return Result{CompletedCues: r.completed, Suspended: r.suspended}
+}
+
 func (r *runner[I, S]) check() ([]Cue[I, S], []Cue[I, S]) {
 	var triggered []Cue[I, S]
 	nextPending := r.pending[:0]
 
-	// Construct current result for When check
 	currentResult := Result{CompletedCues: r.completed}
 
 	for _, c := range r.pending {
-		// Pass input and state by value (dereferenced)
-		// If When is nil, default to true (always run)
+		// A nil When means the cue is always ready.
 		if c.When == nil || c.When(r.input, *r.state, currentResult) {
 			triggered = append(triggered, c)
 		} else {
@@ -409,93 +499,129 @@ func (r *runner[I, S]) check() ([]Cue[I, S], []Cue[I, S]) {
 
 func (r *runner[I, S]) trigger(cues []Cue[I, S]) {
 	for _, c := range cues {
-		r.activeCount++
-		// Snapshot input and state for concurrent execution
+		// Copied, not read live: other cues finishing will change state while
+		// this one runs, and a cue sees the state it was triggered on.
 		cue, input, state := c, r.input, *r.state
-		r.spawn(func() {
-			startTime := r.clock()
-			mutation, err := cue.Run(input, state)
-			endTime := r.clock()
-			r.done <- cueResult[S]{
-				cueName:   cue.Name,
-				mutation:  mutation,
-				err:       err,
-				startTime: startTime,
-				endTime:   endTime,
-			}
+		a := &attempt[S]{name: cue.Name, start: r.engine.Now()}
+		a.future = r.engine.Spawn(func() {
+			// The Engine may be running this on a goroutine of its own, where
+			// an escaping panic would end the process and the caller could not
+			// intervene. Reported as this cue's error instead.
+			defer func() {
+				a.end = r.engine.Now()
+				if p := recover(); p != nil {
+					a.mutation, a.err = nil, panicError(p)
+				}
+			}()
+			a.mutation, a.err = cue.Run(input, state)
 		})
+		r.inflight = append(r.inflight, a)
 	}
 }
 
 func (r *runner[I, S]) isStable() bool {
-	return r.activeCount == 0
+	return len(r.inflight) == 0
 }
 
-// wait absorbs one cue result, or returns an error if the run was cancelled
-// or stalled first. Of its three paths only the final select blocks, so a
-// Deck with a serial Spawn or an Await never performs a blocking operation.
+// wait yields to the Engine until a cue has finished, then absorbs exactly one.
 func (r *runner[I, S]) wait() error {
-	// Take a buffered result first. Under a serial Spawn every result is
-	// already buffered, so that mode never reaches the ctx branch; run checks
-	// ctx between cycles instead.
-	select {
-	case result := <-r.done:
-		return r.absorb(result)
-	default:
+	if err := r.engine.Await(r.ctx, r.futures()); err != nil {
+		return fmt.Errorf("deck run aborted: %w", err)
 	}
-
-	// Yield to the engine's scheduler rather than block. The receive after it
-	// is non-blocking too: if the scheduler returned with nothing ready, no
-	// context could rescue a blocked receive.
-	if r.await != nil {
-		if err := r.await(func() bool { return len(r.done) > 0 }); err != nil {
-			return fmt.Errorf("deck run aborted by Await: %w", err)
-		}
-		select {
-		case result := <-r.done:
-			return r.absorb(result)
-		default:
-			return fmt.Errorf("deck run stalled: Await returned before a cue result was ready")
+	for i, a := range r.inflight {
+		if a.future.IsReady() {
+			r.inflight = append(r.inflight[:i], r.inflight[i+1:]...)
+			r.absorb(a)
+			return nil
 		}
 	}
+	return errors.New("deck run stalled: the engine returned before any cue had finished")
+}
 
-	select {
-	case <-r.ctx.Done():
-		return fmt.Errorf("deck run cancelled: %w", r.ctx.Err())
-	case result := <-r.done:
-		return r.absorb(result)
+// futures lists what the run is currently waiting on, for the Engine to wait
+// on in whatever way suits it.
+func (r *runner[I, S]) futures() []Future {
+	fs := make([]Future, 0, len(r.inflight))
+	for _, a := range r.inflight {
+		fs = append(fs, a.future)
 	}
+	return fs
 }
 
 // absorb applies one finished cue's outcome. A cue's error takes precedence
 // over its mutation: if Run returned an error, the cue is treated as failed —
 // its mutation is discarded and it is not recorded in CompletedCues.
-func (r *runner[I, S]) absorb(result cueResult[S]) error {
-	r.activeCount--
-	if result.err != nil {
-		if r.runErr == nil {
-			r.runErr = fmt.Errorf("cue %s: %w", result.cueName, result.err)
-		}
-		return nil
-	}
-	if result.mutation != nil {
-		result.mutation.apply(r.state)
-		if result.mutation.isSuspended() {
-			r.suspended = true
+func (r *runner[I, S]) absorb(a *attempt[S]) {
+	if a.collect != nil {
+		a.end = r.engine.Now()
+		if err := a.future.Get(); err != nil {
+			a.err = err
 		} else {
-			r.completed = append(r.completed, CompletedCue{
-				Name:      result.cueName,
-				StartTime: result.startTime,
-				EndTime:   result.endTime,
-			})
+			a.mutation, a.err = r.collectResult(a)
 		}
 	}
-	return nil
+	if a.err != nil {
+		if r.runErr == nil {
+			r.runErr = fmt.Errorf("cue %s: %w", a.name, a.err)
+		}
+		return
+	}
+	if a.mutation == nil {
+		return
+	}
+	if w, ok := a.mutation.(*workMutation[S]); ok {
+		// Starting the work is the side effect. A failing run starts none, its
+		// results being about to be discarded. A suspending run starts what the
+		// cue's own Run declared, so the snapshot it exports is whole — but not
+		// work chained from a handler, which could ask for another round
+		// forever.
+		chained := a.collect != nil
+		if r.runErr != nil || (r.suspended && chained) {
+			return
+		}
+		work := w.work
+		work.CueName = a.name
+		r.inflight = append(r.inflight, &attempt[S]{
+			name:    a.name,
+			start:   a.start,
+			future:  r.engine.Execute(r.ctx, work),
+			collect: w.collect,
+		})
+		return
+	}
+	a.mutation.apply(r.state)
+	if a.mutation.isSuspended() {
+		r.suspended = true
+		return
+	}
+	r.completed = append(r.completed, CompletedCue{
+		Name:      a.name,
+		StartTime: a.start,
+		EndTime:   a.end,
+	})
 }
 
-// drain waits for all remaining active cues to complete.
+// collectResult runs the handler a cue gave to Do. It is user code running on
+// the Deck's own goroutine, so a panic here would surface from Run rather than
+// from the cue that caused it.
+func (r *runner[I, S]) collectResult(a *attempt[S]) (m Mutation[S], err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			m, err = nil, panicError(p)
+		}
+	}()
+	return a.collect(), nil
+}
+
+// panicError turns a recovered panic into an error, stack included — without
+// one it is harder to chase than the crash it replaced.
+func panicError(p any) error {
+	return fmt.Errorf("panic: %v\n\n%s", p, debug.Stack())
+}
+
+// drain waits for every cue still in flight to finish.
 func (r *runner[I, S]) drain() error {
-	for r.activeCount > 0 {
+	for len(r.inflight) > 0 {
 		if err := r.wait(); err != nil {
 			return err
 		}
