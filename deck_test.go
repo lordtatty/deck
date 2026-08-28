@@ -2943,3 +2943,116 @@ func TestDeck_WithEngine_LetsOneDeckServeConcurrentRuns(t *testing.T) {
 	// there was nothing to race on.
 	assert.Nil(t, sut.Engine, "WithEngine must copy the Deck, not modify it")
 }
+
+// --- Panics in user code ---
+
+// A cue is user code, often calling further user code, so it can panic. Where
+// that panic surfaced used to depend entirely on the Engine: with Serial it
+// reached the caller, under Temporal the SDK caught it, and under the default
+// Engine it ran on a goroutine deck had created — killing the process, with no
+// way for the caller to defend against it.
+//
+// Deck now turns a panic in user code into the cue error it already has a path
+// for, identically under every Engine. These three tests cover the three places
+// deck calls into user code, and each runs across the whole table because
+// consistency between engines is the point.
+
+func TestDeck_Run_PanicInCueRunBecomesACueError(t *testing.T) {
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given a cue whose Run panics
+			cue := deck.Cue[struct{}, TestState]{
+				Name: "Boom",
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					panic("cue exploded")
+				},
+			}
+			sut, err := deck.New(cue)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			// When the deck runs
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			state := &TestState{Count: 7}
+			result, err := runBounded(t, sut, ctx, struct{}{}, state)
+
+			// Then the run fails, naming the cue and carrying the panic and a
+			// stack trace — without which a recovered panic is far harder to
+			// chase than the crash it replaced
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cue Boom")
+			assert.Contains(t, err.Error(), "cue exploded")
+			assert.Contains(t, err.Error(), "goroutine")
+			assert.False(t, result.Completed("Boom"))
+			assert.Equal(t, 7, state.Count, "state should not be copied back")
+		})
+	}
+}
+
+func TestDeck_Run_PanicInDeclaredWorkBecomesACueError(t *testing.T) {
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given work declared with Do that panics when the Engine runs it
+			exploding := func(_ context.Context, _ string) (string, error) {
+				panic("work exploded")
+			}
+			cue := deck.Cue[struct{}, TestState]{
+				Name: "Boom",
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Do(exploding, "x", func(string) deck.Mutation[TestState] {
+						return deck.Complete(func(s *TestState) { s.Count = 99 })
+					}), nil
+				},
+			}
+			sut, err := deck.New(cue)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			// When the deck runs
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			state := &TestState{Count: 7}
+			_, err = runBounded(t, sut, ctx, struct{}{}, state)
+
+			// Then it fails the same way as a panic in Run
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cue Boom")
+			assert.Contains(t, err.Error(), "work exploded")
+			assert.Equal(t, 7, state.Count)
+		})
+	}
+}
+
+func TestDeck_Run_PanicInResultHandlerBecomesACueError(t *testing.T) {
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given work that succeeds but whose result handler panics. That
+			// handler runs on deck's own goroutine rather than the Engine's, so
+			// it is a separate path from the two above.
+			cue := deck.Cue[struct{}, TestState]{
+				Name: "Boom",
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Do(slowValue, "x", func(string) deck.Mutation[TestState] {
+						panic("handler exploded")
+					}), nil
+				},
+			}
+			sut, err := deck.New(cue)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			// When the deck runs
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			state := &TestState{Count: 7}
+			_, err = runBounded(t, sut, ctx, struct{}{}, state)
+
+			// Then it fails the same way again
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "cue Boom")
+			assert.Contains(t, err.Error(), "handler exploded")
+			assert.Equal(t, 7, state.Count)
+		})
+	}
+}

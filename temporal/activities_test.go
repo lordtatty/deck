@@ -3,6 +3,7 @@ package temporal_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 )
@@ -110,4 +112,55 @@ func TestOneActivityPerDoAndNoneForComplete(t *testing.T) {
 	// read state — four cues, three activities
 	t.Logf("4 cues, 3 of them using Do -> %d activities scheduled", scheduled)
 	assert.Equal(t, 3, scheduled)
+}
+
+// PanickingCueWorkflow is the Temporal half of the panic story. Before deck
+// recovered panics the SDK caught this one and reported a workflow panic; now
+// it arrives as an ordinary cue error, the same as under every other Engine.
+func PanickingCueWorkflow(ctx workflow.Context) (countState, error) {
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 30 * time.Second,
+	})
+	cue := deck.Cue[struct{}, countState]{
+		Name: "Boom",
+		Run: func(_ struct{}, _ countState) (deck.Mutation[countState], error) {
+			panic("cue exploded")
+		},
+	}
+	d, err := deck.New(cue)
+	if err != nil {
+		return countState{}, fmt.Errorf("build deck: %w", err)
+	}
+	d.Engine = decktemporal.New(ctx)
+
+	var s countState
+	if _, err := d.Run(context.Background(), struct{}{}, &s); err != nil {
+		return s, fmt.Errorf("run deck: %w", err)
+	}
+	return s, nil
+}
+
+func TestAPanickingCueFailsTheWorkflowAsACueError(t *testing.T) {
+	// Given a cue that panics inside a workflow
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	env.ExecuteWorkflow(PanickingCueWorkflow)
+
+	// When the workflow finishes
+	require.True(t, env.IsWorkflowCompleted())
+	err := env.GetWorkflowError()
+
+	// Then it failed with the cue named, rather than as a bare panic — the same
+	// shape a caller sees from any other Engine
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "cue Boom")
+	assert.Contains(t, err.Error(), "cue exploded")
+	t.Logf("workflow error: %v", firstLine(err.Error()))
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }

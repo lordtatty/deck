@@ -74,6 +74,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"time"
 )
 
@@ -141,6 +142,12 @@ type Cue[I, S any] struct {
 	// The returned mutation is discarded and the cue is not recorded in
 	// Result.CompletedCues. If multiple concurrent cues error, the first
 	// observed error wins.
+	//
+	// A panic is treated the same way, and reported with the panic value and a
+	// stack trace. Deck recovers it because an Engine may be running Run on a
+	// goroutine of its own, where a panic would end the process and the caller
+	// would have no way to intervene. Work declared with Do, and the handler
+	// given to it, are covered too.
 	Run func(I, S) (Mutation[S], error)
 }
 
@@ -233,10 +240,17 @@ func Do[S, A, R any](
 			Func:   fn,
 			Arg:    arg,
 			Result: &result,
-			Local: func(ctx context.Context) error {
-				out, err := fn(ctx, arg)
-				if err != nil {
-					return err
+			Local: func(ctx context.Context) (err error) {
+				// As in trigger: fn is user code, and an Engine may be running
+				// it on a goroutine of its own.
+				defer func() {
+					if p := recover(); p != nil {
+						err = panicError(p)
+					}
+				}()
+				out, callErr := fn(ctx, arg)
+				if callErr != nil {
+					return callErr
 				}
 				result = out
 				return nil
@@ -487,8 +501,17 @@ func (r *runner[I, S]) trigger(cues []Cue[I, S]) {
 		cue, input, state := c, r.input, *r.state
 		a := &attempt[S]{name: cue.Name, start: r.engine.Now()}
 		a.future = r.engine.Spawn(func() {
+			// A cue is user code and may panic. Under the default Engine it
+			// runs on a goroutine deck created, where a panic would kill the
+			// process and the caller could do nothing about it. Turning it into
+			// this cue's error means every Engine behaves the same way.
+			defer func() {
+				a.end = r.engine.Now()
+				if p := recover(); p != nil {
+					a.mutation, a.err = nil, panicError(p)
+				}
+			}()
 			a.mutation, a.err = cue.Run(input, state)
-			a.end = r.engine.Now()
 		})
 		r.inflight = append(r.inflight, a)
 	}
@@ -533,7 +556,7 @@ func (r *runner[I, S]) absorb(a *attempt[S]) {
 		if err := a.future.Get(); err != nil {
 			a.err = err
 		} else {
-			a.mutation = a.collect()
+			a.mutation, a.err = r.collectResult(a)
 		}
 	}
 	if a.err != nil {
@@ -568,6 +591,25 @@ func (r *runner[I, S]) absorb(a *attempt[S]) {
 		StartTime: a.start,
 		EndTime:   a.end,
 	})
+}
+
+// collectResult runs the handler a cue gave to Do. It is user code running on
+// the Deck's own goroutine, so a panic here would surface from Run rather than
+// from the cue that caused it.
+func (r *runner[I, S]) collectResult(a *attempt[S]) (m Mutation[S], err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			m, err = nil, panicError(p)
+		}
+	}()
+	return a.collect(), nil
+}
+
+// panicError turns a recovered panic into an error. The stack is included
+// because a panic reported without one is harder to chase than the crash it
+// replaced.
+func panicError(p any) error {
+	return fmt.Errorf("panic: %v\n\n%s", p, debug.Stack())
 }
 
 // drain waits for every cue still in flight to finish.

@@ -13,6 +13,7 @@ A streamlined Go package for orchestrating concurrent, state-driven agent execut
 *   **Engine**: Where cues run. Leave it nil for goroutines and the wall clock, or set it to run one at a time for a reproducible test — or inside a Temporal workflow, where the flow becomes durable.
 *   **Declared Work**: A cue can perform its work itself, or describe it with `deck.Do` and let the Engine perform it. Describing it is what lets one set of cues run both locally and durably.
 *   **Result History**: `Run()` returns a `Result` struct containing execution history, which cues can inspect.
+*   **Contained Panics**: a panic in a cue becomes that cue's error, with a stack trace, rather than ending the process.
 *   **Suspend/Resume**: Cues can signal suspension for long-running async work. The Deck stops cleanly and can be resumed later.
 *   **Export/Import**: Serialise state and result to bytes with `Export()` and restore with `Import()`. Input is **not** in the snapshot — the caller provides it fresh on resume.
 
@@ -215,6 +216,17 @@ d.Engine = deck.Serial()  // one at a time, in registration order — reproducib
 ```
 
 `deck.Serial()` is what you want in a test that asserts on ordering: it runs each cue inline to completion, so the same run happens the same way every time. `deck.WithClock(engine, now)` layers a fixed clock onto any engine so `CompletedCue` timestamps are predictable too.
+
+Because an Engine may run your cues on goroutines it owns, deck recovers panics in cue code and reports them as that cue's error, with a stack trace:
+
+```
+cue Boom: panic: cue exploded
+
+goroutine 9 [running]:
+...
+```
+
+The run then stops and drains exactly as it would for a returned error. Without this, a panic on an Engine's goroutine would take the process down and the caller could do nothing about it — `recover` never sees a panic from another goroutine. It applies to a cue's `Run`, to work declared with `Do`, and to the handler `Do` was given, so the behaviour is the same under every Engine.
 
 Anything satisfying the `Engine` interface will do, so you can supply your own. The contract is deliberately small, and nothing in it is specific to any one system — an engine has to:
 
