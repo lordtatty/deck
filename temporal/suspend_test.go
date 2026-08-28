@@ -2,6 +2,7 @@ package temporal_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -148,4 +149,95 @@ func TestSuspendAndResumeWorkUnderTheTemporalEngine(t *testing.T) {
 	assert.Equal(t, []string{"collect"}, out.Completed)
 	t.Logf("suspended=%v snapshot=%d bytes final=%+v completed=%v",
 		out.SuspendedFirst, out.SnapshotBytes, out.Final, out.Completed)
+}
+
+// The test above does the whole cycle inside one workflow, which proves the
+// pieces work under the Engine but not the shape anyone would actually use.
+// This is that shape: one workflow suspends and hands back a snapshot, the
+// snapshot survives outside Temporal entirely, and a second, separate workflow
+// execution picks it up and finishes the flow.
+//
+// It is the pattern deck's README steers Temporal users away from — Temporal is
+// already keeping the flow alive, so ending the workflow to persist state
+// yourself gives that up. But the README also says it still works, and this is
+// what makes that claim checkable rather than reassuring.
+
+func SuspendOnlyWorkflow(ctx workflow.Context, topic string) ([]byte, error) {
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 30 * time.Second,
+	})
+	d, err := deck.New(suspendCues()...)
+	if err != nil {
+		return nil, fmt.Errorf("build deck: %w", err)
+	}
+	d.Engine = decktemporal.New(ctx)
+
+	var state suspState
+	result, err := d.Run(context.Background(), topic, &state)
+	if err != nil {
+		return nil, fmt.Errorf("run: %w", err)
+	}
+	if !result.Suspended {
+		return nil, errors.New("expected the flow to suspend")
+	}
+	snapshot, err := d.Export(&state, result)
+	if err != nil {
+		return nil, fmt.Errorf("export: %w", err)
+	}
+	return snapshot, nil
+}
+
+func ResumeFromSnapshotWorkflow(ctx workflow.Context, snapshot []byte, topic string) (suspState, error) {
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 30 * time.Second,
+	})
+	d, err := deck.New(suspendCues()...)
+	if err != nil {
+		return suspState{}, fmt.Errorf("build deck: %w", err)
+	}
+	d.Engine = decktemporal.New(ctx)
+
+	restored, prev, err := d.Import(snapshot)
+	if err != nil {
+		return suspState{}, fmt.Errorf("import: %w", err)
+	}
+	if _, err := d.Run(context.Background(), topic, restored, prev); err != nil {
+		return *restored, fmt.Errorf("resume: %w", err)
+	}
+	return *restored, nil
+}
+
+func TestAFlowResumesInASeparateWorkflowExecution(t *testing.T) {
+	newEnv := func() *testsuite.TestWorkflowEnvironment {
+		var suite testsuite.WorkflowTestSuite
+		env := suite.NewTestWorkflowEnvironment()
+		env.RegisterActivity(SubmitJob)
+		env.RegisterActivity(FetchResult)
+		return env
+	}
+
+	// Given a first workflow that suspends and hands back a snapshot
+	first := newEnv()
+	first.ExecuteWorkflow(SuspendOnlyWorkflow, "widgets")
+	require.True(t, first.IsWorkflowCompleted())
+	require.NoError(t, first.GetWorkflowError())
+
+	var snapshot []byte
+	require.NoError(t, first.GetWorkflowResult(&snapshot))
+	require.NotEmpty(t, snapshot)
+	t.Logf("snapshot handed out of workflow 1: %s", snapshot)
+
+	// When a second, entirely separate execution resumes from it
+	second := newEnv()
+	second.ExecuteWorkflow(ResumeFromSnapshotWorkflow, snapshot, "widgets")
+	require.True(t, second.IsWorkflowCompleted())
+	require.NoError(t, second.GetWorkflowError())
+
+	var final suspState
+	require.NoError(t, second.GetWorkflowResult(&final))
+
+	// Then the flow finished, with the second execution picking up exactly
+	// where the first left off rather than starting again
+	assert.Equal(t, "job-for-widgets", final.JobID)
+	assert.Equal(t, "result of job-for-widgets", final.Result)
 }

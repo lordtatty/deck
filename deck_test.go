@@ -3056,3 +3056,46 @@ func TestDeck_Run_PanicInResultHandlerBecomesACueError(t *testing.T) {
 		})
 	}
 }
+
+// The runner costs O(n²) in the number of cues triggered at once: each absorbed
+// cue rebuilds the list of outstanding futures, scans it twice, and removes
+// from the middle of a slice. Measured, doubling the cues roughly doubles the
+// per-cue cost — 1,000 cues take ~5ms, 8,000 take ~236ms.
+//
+// That is left alone deliberately. Realistic flows have tens of cues, where the
+// cost is microseconds, and the loop is the one place determinism matters most,
+// so it is not worth complicating to serve a size nobody has. This test exists
+// to catch a change that makes it dramatically worse, not to assert a big-O:
+// the bound is loose enough to be stable on a busy machine and tight enough
+// that another factor of n would blow it.
+func TestDeck_Run_HandlesALargeFanOut(t *testing.T) {
+	// Given a thousand cues that all trigger in the same cycle
+	const cueCount = 1000
+	var cues []deck.Cue[struct{}, TestState]
+	for i := range cueCount {
+		cues = append(cues, deck.Cue[struct{}, TestState]{
+			Name: fmt.Sprintf("cue%d", i),
+			Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+				return deck.Complete(func(s *TestState) { s.Count++ }), nil
+			},
+		})
+	}
+	sut, err := deck.New(cues...)
+	require.NoError(t, err)
+	sut.Engine = deck.Serial()
+
+	// When the deck runs
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	state := &TestState{}
+	start := time.Now()
+	result, err := runBounded(t, sut, ctx, struct{}{}, state)
+	elapsed := time.Since(start)
+
+	// Then every cue completed, in a time that stays sane at this size
+	require.NoError(t, err)
+	assert.Equal(t, cueCount, state.Count)
+	assert.Len(t, result.CompletedCues, cueCount)
+	t.Logf("%d cues in %v (%v per cue)", cueCount, elapsed.Round(time.Millisecond), elapsed/cueCount)
+	assert.Less(t, elapsed, 2*time.Second, "a thousand cues should not take seconds")
+}

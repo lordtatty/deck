@@ -164,3 +164,87 @@ func firstLine(s string) string {
 	}
 	return s
 }
+
+// A wide fan-out is where a workflow meets limits deck does not have: every Do
+// is an activity, and every activity is several entries in the workflow's
+// history. Fifty at once is a realistic ceiling for a real flow, and worth
+// knowing works — the core handles thousands, but the constraint here is
+// Temporal's, not the runner's.
+func TestAWideFanOutCompletesInOneWorkflow(t *testing.T) {
+	c := startDevServer(t)
+
+	w := worker.New(c, wideQueue, worker.Options{})
+	w.RegisterWorkflow(WideFanOutWorkflow)
+	w.RegisterActivity(Echo)
+	require.NoError(t, w.Start())
+	t.Cleanup(w.Stop)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	// Given fifty independent cues, each declaring its own activity
+	start := time.Now()
+	run, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:        fmt.Sprintf("wide-%d", time.Now().UnixNano()),
+		TaskQueue: wideQueue,
+	}, WideFanOutWorkflow)
+	require.NoError(t, err)
+
+	var out countState
+	require.NoError(t, run.Get(ctx, &out))
+	elapsed := time.Since(start)
+
+	// Then all fifty completed
+	assert.Len(t, out.Values, wideCount)
+
+	// And the history stayed proportionate: a handful of events per activity,
+	// nothing quadratic
+	hist := historyOf(t, c, run.GetID(), run.GetRunID())
+	scheduled := 0
+	for _, e := range hist.Events {
+		if e.GetEventType() == enumspb.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED {
+			scheduled++
+		}
+	}
+	t.Logf("%d cues -> %d activities, %d history events, %v",
+		wideCount, scheduled, len(hist.Events), elapsed.Round(10*time.Millisecond))
+	assert.Equal(t, wideCount, scheduled)
+	assert.Less(t, len(hist.Events), wideCount*10,
+		"history should grow in proportion to the activities, not faster")
+}
+
+const (
+	wideQueue = "deck-wide-fanout"
+	wideCount = 50
+)
+
+func WideFanOutWorkflow(ctx workflow.Context) (countState, error) {
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 30 * time.Second,
+	})
+
+	var cues []deck.Cue[struct{}, countState]
+	for i := range wideCount {
+		name := fmt.Sprintf("cue%d", i)
+		cues = append(cues, deck.Cue[struct{}, countState]{
+			Name: name,
+			Run: func(_ struct{}, _ countState) (deck.Mutation[countState], error) {
+				return deck.Do(Echo, name, func(v string) deck.Mutation[countState] {
+					return deck.Complete(func(s *countState) { s.Values = append(s.Values, v) })
+				}), nil
+			},
+		})
+	}
+
+	d, err := deck.New(cues...)
+	if err != nil {
+		return countState{}, fmt.Errorf("build deck: %w", err)
+	}
+	d.Engine = decktemporal.New(ctx)
+
+	var s countState
+	if _, err := d.Run(context.Background(), struct{}{}, &s); err != nil {
+		return s, fmt.Errorf("run deck: %w", err)
+	}
+	return s, nil
+}
