@@ -6,10 +6,8 @@
 // changes.
 //
 // This is the simplest demonstration that the two worlds agree, with no
-// indirection in the way. For the same idea arranged the way a service would
-// really be built — a Runner interface, and the choice made once at startup —
-// see examples/eitherway. For what Temporal gives you beyond running the flow
-// at all, see examples/temporal.
+// indirection in the way. The README in the examples directory says which of
+// them answers which question.
 //
 //	go run .
 //

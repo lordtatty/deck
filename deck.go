@@ -109,15 +109,13 @@ type Deck[I, S any] struct {
 // It exists so that a Deck built once can serve many runs at once, each with
 // its own engine:
 //
-//	var flow, _ = deck.New(cues...)
+//	var flow, _ = deck.New(cues...)   // once, at startup
 //
-//	func MyWorkflow(ctx workflow.Context) error {
-//		d := flow.WithEngine(temporal.New(ctx))
-//		...
-//	}
+//	d := flow.WithEngine(engine)      // per run
+//	_, err := d.Run(ctx, input, &state)
 //
-// Assigning to flow.Engine there would look equivalent and would race with
-// every other workflow the worker is running.
+// Assigning to flow.Engine looks equivalent and races with every other run
+// in flight.
 func (d *Deck[I, S]) WithEngine(e Engine) *Deck[I, S] {
 	c := *d
 	c.Engine = e
@@ -148,11 +146,9 @@ type Cue[I, S any] struct {
 	// Result.CompletedCues. If multiple concurrent cues error, the first
 	// observed error wins.
 	//
-	// A panic is treated the same way, and reported with the panic value and a
-	// stack trace. Deck recovers it because an Engine may be running Run on a
-	// goroutine of its own, where a panic would end the process and the caller
-	// would have no way to intervene. Work declared with Do, and the handler
-	// given to it, are covered too.
+	// A panic is treated the same way, reported with the panic value and a
+	// stack trace. Work declared with Do, and the handler given to it, are
+	// covered too.
 	Run func(I, S) (Mutation[S], error)
 }
 
@@ -230,10 +226,9 @@ func Suspended[S any](fn func(*S)) Mutation[S] {
 // where a Do would cost a scheduled unit of work and an entry in the run's
 // history.
 //
-// Under the default Engine, fn is simply called on its own goroutine. Under a
-// durable engine it may run elsewhere — as a Temporal activity, say — so fn and
-// arg must carry everything the work needs, and the result must survive being
-// serialised. The cue is not recorded as completed until then has run.
+// Under the default Engine fn is called on its own goroutine. Under a durable
+// engine it may run in another process entirely, so fn and arg must carry
+// everything the work needs, and the result must survive being serialised.
 func Do[S, A, R any](
 	fn func(context.Context, A) (R, error),
 	arg A,
@@ -246,8 +241,8 @@ func Do[S, A, R any](
 			Arg:    arg,
 			Result: &result,
 			Local: func(ctx context.Context) (err error) {
-				// As in trigger: fn is user code, and an Engine may be running
-				// it on a goroutine of its own.
+				// fn is user code, and the Engine may be running it on a
+				// goroutine the caller cannot reach.
 				defer func() {
 					if p := recover(); p != nil {
 						err = panicError(p)
@@ -485,12 +480,10 @@ func (r *runner[I, S]) check() ([]Cue[I, S], []Cue[I, S]) {
 	var triggered []Cue[I, S]
 	nextPending := r.pending[:0]
 
-	// Construct current result for When check
 	currentResult := Result{CompletedCues: r.completed}
 
 	for _, c := range r.pending {
-		// Pass input and state by value (dereferenced)
-		// If When is nil, default to true (always run)
+		// A nil When means the cue is always ready.
 		if c.When == nil || c.When(r.input, *r.state, currentResult) {
 			triggered = append(triggered, c)
 		} else {
@@ -502,14 +495,14 @@ func (r *runner[I, S]) check() ([]Cue[I, S], []Cue[I, S]) {
 
 func (r *runner[I, S]) trigger(cues []Cue[I, S]) {
 	for _, c := range cues {
-		// Snapshot input and state for concurrent execution
+		// Copied, not read live: other cues finishing will change state while
+		// this one runs, and a cue sees the state it was triggered on.
 		cue, input, state := c, r.input, *r.state
 		a := &attempt[S]{name: cue.Name, start: r.engine.Now()}
 		a.future = r.engine.Spawn(func() {
-			// A cue is user code and may panic. Under the default Engine it
-			// runs on a goroutine deck created, where a panic would kill the
-			// process and the caller could do nothing about it. Turning it into
-			// this cue's error means every Engine behaves the same way.
+			// The Engine may be running this on a goroutine of its own, where
+			// an escaping panic would end the process and the caller could not
+			// intervene. Reported as this cue's error instead.
 			defer func() {
 				a.end = r.engine.Now()
 				if p := recover(); p != nil {
@@ -556,7 +549,6 @@ func (r *runner[I, S]) futures() []Future {
 // its mutation is discarded and it is not recorded in CompletedCues.
 func (r *runner[I, S]) absorb(a *attempt[S]) {
 	if a.collect != nil {
-		// The work this cue declared has finished.
 		a.end = r.engine.Now()
 		if err := a.future.Get(); err != nil {
 			a.err = err
@@ -574,11 +566,10 @@ func (r *runner[I, S]) absorb(a *attempt[S]) {
 		return
 	}
 	if w, ok := a.mutation.(*workMutation[S]); ok {
-		// The cue declared work rather than a state change. Starting it is what
-		// causes the side effect, so once the run has decided to stop, it is
-		// not started at all — draining is for letting work in flight finish,
-		// not for beginning more. The cue is left uncompleted, so a resumed run
-		// will trigger it again.
+		// Starting the work is what causes the side effect, so a run that has
+		// already decided to stop does not start it: draining lets work in
+		// flight finish, not begin. The cue stays uncompleted, so a resumed
+		// run triggers it again.
 		if r.runErr != nil || r.suspended {
 			return
 		}
@@ -616,9 +607,8 @@ func (r *runner[I, S]) collectResult(a *attempt[S]) (m Mutation[S], err error) {
 	return a.collect(), nil
 }
 
-// panicError turns a recovered panic into an error. The stack is included
-// because a panic reported without one is harder to chase than the crash it
-// replaced.
+// panicError turns a recovered panic into an error, stack included — without
+// one it is harder to chase than the crash it replaced.
 func panicError(p any) error {
 	return fmt.Errorf("panic: %v\n\n%s", p, debug.Stack())
 }

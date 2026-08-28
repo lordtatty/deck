@@ -114,9 +114,9 @@ func TestOneActivityPerDoAndNoneForComplete(t *testing.T) {
 	assert.Equal(t, 3, scheduled)
 }
 
-// PanickingCueWorkflow is the Temporal half of the panic story. Before deck
-// recovered panics the SDK caught this one and reported a workflow panic; now
-// it arrives as an ordinary cue error, the same as under every other Engine.
+// PanickingCueWorkflow checks the Temporal half of the panic story: a cue that
+// panics should fail the workflow as a named cue error, the same shape a caller
+// sees under every other Engine.
 func PanickingCueWorkflow(ctx workflow.Context) (countState, error) {
 	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: 30 * time.Second,

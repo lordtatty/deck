@@ -16,8 +16,7 @@ import (
 type Engine interface {
 	// Now stamps cue start and end times. It is called from inside each cue as
 	// well as from the run itself, so unless Spawn runs cues one at a time it
-	// must be safe for concurrent use — the obvious counter-based test clock
-	// races otherwise, and only -race will say so.
+	// must be safe for concurrent use.
 	Now() time.Time
 
 	// Spawn runs fn exactly once, now or later, and returns a handle reporting
@@ -33,9 +32,9 @@ type Engine interface {
 	// Await yields until at least one of fs is ready. Returning an error stops
 	// the run: a cancelled context, or the engine's own cancellation.
 	//
-	// It is given the handles rather than a condition to evaluate, because
-	// waiting on a named set of outstanding work is the primitive engines
-	// tend to offer. Use AnyReady if it is easier to poll.
+	// It takes the handles rather than a condition to evaluate, since "wait for
+	// any of these" is the primitive engines tend to offer. AnyReady covers the
+	// other case.
 	Await(ctx context.Context, fs []Future) error
 }
 
@@ -50,8 +49,9 @@ func AnyReady(fs []Future) bool {
 	return false
 }
 
-// Work is a unit of work a cue declared with Do. Every field is here so that
-// an Engine can choose how to perform it, rather than deck deciding for it.
+// Work is a unit of work a cue declared with Do. It describes the job twice —
+// as a function to call here, and as something an Engine can schedule
+// elsewhere — so the Engine picks, rather than deck picking for it.
 type Work struct {
 	// CueName is the cue that declared this work. An Engine can use it to
 	// treat one cue's work differently from another's — a longer timeout, a
@@ -60,8 +60,8 @@ type Work struct {
 	CueName string
 
 	// Func and Arg identify the work. An Engine that runs work elsewhere
-	// schedules it by these — Temporal, for one, resolves Func to the activity
-	// registered under its name.
+	// schedules it by these, typically resolving Func to something it has
+	// registered under the same name.
 	Func any
 	Arg  any
 

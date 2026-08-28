@@ -2005,11 +2005,10 @@ func TestDeck_Run_AlreadyCancelledContext_TriggersNothing(t *testing.T) {
 	}
 }
 
-// The harder half of the pair: cancelled mid-flight rather than up front. This
-// is the case that regressed once — a result already waiting used to beat
-// ctx.Done(), so a chain of cues kept triggering new work under a dead context
-// and ran to completion. Counting how often the second cue starts is what
-// catches that; a returned error alone would not.
+// The harder half of the pair: cancelled mid-flight rather than up front, and
+// the half that regressed once. Counting how often the second cue starts is
+// what catches it — a chain that keeps triggering work under a dead context
+// still returns an error at the end, so asserting on the error alone passes.
 func TestDeck_Run_CancelledFromInsideACue_TriggersNoFurtherCues(t *testing.T) {
 	marker := t.Name()
 	for _, mode := range executionModes() {
@@ -2184,11 +2183,10 @@ func TestDeck_Run_Await_SchedulerCancellationSurfacesAsError(t *testing.T) {
 	assert.Len(t, sched.queue, 1)
 }
 
-// Abandoned cues used to leak. Run would return on cancellation without
-// draining, and every cue still in flight parked forever trying to hand back a
-// result nobody was left to receive — one stuck goroutine per abandoned cue,
-// for the life of the process. Nothing about a leak shows up in a normal test,
-// so it needs counting directly.
+// Cancelling a run abandons the cues still in flight, and they have to finish
+// and exit rather than parking forever on a result nobody will collect. This
+// leaked once. Nothing about a leaked goroutine shows up in an ordinary
+// assertion, so they are counted directly.
 func TestDeck_Run_Cancellation_DoesNotLeakCueGoroutines(t *testing.T) {
 	// Given cues that block until released, each abandoned by a cancelled run
 	const runs = 20
@@ -2946,16 +2944,15 @@ func TestDeck_WithEngine_LetsOneDeckServeConcurrentRuns(t *testing.T) {
 
 // --- Panics in user code ---
 
-// A cue is user code, often calling further user code, so it can panic. Where
-// that panic surfaced used to depend entirely on the Engine: with Serial it
-// reached the caller, under Temporal the SDK caught it, and under the default
-// Engine it ran on a goroutine deck had created — killing the process, with no
-// way for the caller to defend against it.
+// A cue is user code, often calling further user code, so it can panic. Deck
+// turns that into the cue error it already has a path for, rather than letting
+// it surface differently under each Engine — under the default one it would run
+// on a goroutine deck created, ending the process with the caller unable to
+// intervene.
 //
-// Deck now turns a panic in user code into the cue error it already has a path
-// for, identically under every Engine. These three tests cover the three places
-// deck calls into user code, and each runs across the whole table because
-// consistency between engines is the point.
+// These three tests cover the three places deck calls into user code, and each
+// runs across the whole table, because behaving the same everywhere is the
+// point.
 
 func TestDeck_Run_PanicInCueRunBecomesACueError(t *testing.T) {
 	for _, mode := range executionModes() {
@@ -3156,14 +3153,13 @@ func TestDeck_Run_OneEngineSharedBetweenConcurrentRuns(t *testing.T) {
 	assert.Less(t, took[0], slow, "the fast run should not have waited for the slow one's cue")
 }
 
-// Draining is meant to let cues in flight finish, but a cue whose Run declared
-// work with Do has not started that work yet — the Engine starts it when the
-// Deck absorbs the cue. Absorbing during a drain therefore used to *begin* new
-// work after the run had already decided to fail: a fresh HTTP call locally, a
-// newly scheduled activity under a durable engine, both after the abort.
+// Draining lets cues in flight finish. A cue whose Run declared work with Do
+// has not started that work yet, though — the Engine starts it when the Deck
+// absorbs the cue — so draining must not absorb one, or a failing run would
+// begin a fresh HTTP call, or schedule a new activity, after deciding to abort.
 //
 // Serial ordering makes it deterministic: "explode" is registered first, so its
-// error is absorbed before "worker" is reached in the drain.
+// error lands before "worker" is reached in the drain.
 func TestDeck_Run_DoesNotStartDeclaredWorkAfterAnError(t *testing.T) {
 	// Given a cue that fails, and a sibling that declared work
 	boom := errors.New("boom")

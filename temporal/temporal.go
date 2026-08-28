@@ -8,48 +8,28 @@
 //		StartToCloseTimeout: time.Minute,
 //	})
 //
-//	d, err := deck.New(cues...)
-//	if err != nil {
-//		return err
-//	}
-//	d.Engine = temporal.New(ctx)
-//	_, err = d.Run(context.Background(), input, &state)
+//	d := flowDeck.WithEngine(temporal.New(ctx))
+//	_, err := d.Run(context.Background(), input, &state)
 //
-// Work a cue declares with deck.Do becomes an activity. Register the same
-// functions with your worker, and Temporal resolves them by name.
+// Work a cue declares with deck.Do becomes an activity: register the same
+// functions with your worker and Temporal resolves them by name. Use ForCue
+// where one cue needs different activity settings from the rest.
 //
-// deck's own Suspend/Export/Import still work here, but they are usually the
-// wrong tool once Temporal is doing the durability: suspending ends the
-// workflow, and resuming means starting a new one. For long-running or
-// callback-driven work, keep the cue a normal deck.Do and use a generous
-// activity timeout, Temporal's async activity completion, or a signal.
+// Four things behave differently here than under the default engine:
 //
-// One trade-off to be aware of. A panic in workflow code would normally fail
-// the workflow *task*, which Temporal retries indefinitely — so a panicking cue
-// would pause the workflow until a fixed build was deployed, and then carry on.
-// Deck instead recovers panics in cue code and reports them as that cue's
-// error, because under other engines a panic runs on a goroutine the caller
-// cannot reach and would end the process. The consequence here is that a
-// panicking cue fails the workflow execution rather than pausing it. Treat a
-// panic in a cue as the bug it is, rather than as a deployable-fix pause.
-//
-// Two things to know:
-//
-//   - Cancellation reaches the Deck through the workflow context this engine
-//     holds, not through the context passed to Run. Pass context.Background().
+//   - Cancellation arrives through the workflow context this engine holds,
+//     not the one passed to Run. Pass context.Background() there.
 //
 //   - A cue's Run executes inline on the workflow coroutine, so it must not
-//     block. Declare work with deck.Do instead; a cue that blocks will trip
+//     block. Declare slow work with deck.Do; a cue that blocks trips
 //     Temporal's deadlock detector.
 //
-// Where one cue needs different activity settings from the rest, name it in the
-// wiring rather than in the flow:
+//   - A panicking cue fails the workflow execution. Temporal would otherwise
+//     retry the workflow task, letting a fixed deploy resume it — deck
+//     recovers the panic first, to behave the same way under every engine.
 //
-//	d.Engine = temporal.New(ctx,
-//		temporal.ForCue("summarise", workflow.ActivityOptions{
-//			StartToCloseTimeout: 10 * time.Minute,
-//		}),
-//	)
+//   - deck's own Suspend and Export still work, but end the workflow. With
+//     Temporal providing the durability you rarely want them; see the README.
 package temporal
 
 import (
