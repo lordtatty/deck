@@ -11,7 +11,6 @@ import (
 	decktemporal "github.com/lordtatty/deck/temporal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
@@ -32,15 +31,10 @@ func Echo(ctx context.Context, name string) (string, error) {
 	return "v:" + name, nil
 }
 
-// CountingWorkflow has four cues. Three declare work with Do; the fourth only
-// reads state, so it returns Complete and never leaves the workflow.
-func CountingWorkflow(ctx workflow.Context) (countState, error) {
-	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout: 30 * time.Second,
-	})
-
-	var cues []deck.Cue[struct{}, countState]
-	for _, n := range []string{"a", "b", "c"} {
+// echoCues returns one cue per name, each declaring an Echo activity.
+func echoCues(names ...string) []deck.Cue[struct{}, countState] {
+	cues := make([]deck.Cue[struct{}, countState], 0, len(names))
+	for _, n := range names {
 		name := n
 		cues = append(cues, deck.Cue[struct{}, countState]{
 			Name: name,
@@ -51,19 +45,14 @@ func CountingWorkflow(ctx workflow.Context) (countState, error) {
 			},
 		})
 	}
-	cues = append(cues, deck.Cue[struct{}, countState]{
-		Name: "report",
-		When: func(_ struct{}, _ countState, r deck.Result) bool {
-			return r.Completed("a") && r.Completed("b") && r.Completed("c")
-		},
-		// No Do: this cue only assembles what the others fetched, so it costs
-		// the workflow nothing.
-		Run: func(_ struct{}, s countState) (deck.Mutation[countState], error) {
-			report := fmt.Sprintf("%d values", len(s.Values))
-			return deck.Complete(func(s *countState) { s.Report = report }), nil
-		},
-	})
+	return cues
+}
 
+// runCountDeck is the workflow-side wiring every test in this file shares.
+func runCountDeck(ctx workflow.Context, cues ...deck.Cue[struct{}, countState]) (countState, error) {
+	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+		StartToCloseTimeout: 30 * time.Second,
+	})
 	d, err := deck.New(cues...)
 	if err != nil {
 		return countState{}, fmt.Errorf("build deck: %w", err)
@@ -77,14 +66,31 @@ func CountingWorkflow(ctx workflow.Context) (countState, error) {
 	return s, nil
 }
 
+// CountingWorkflow has four cues. Three declare work with Do; the fourth only
+// reads state, so it returns Complete and never leaves the workflow.
+func CountingWorkflow(ctx workflow.Context) (countState, error) {
+	cues := echoCues("a", "b", "c")
+	cues = append(cues, deck.Cue[struct{}, countState]{
+		Name: "report",
+		When: func(_ struct{}, _ countState, r deck.Result) bool {
+			return r.Completed("a") && r.Completed("b") && r.Completed("c")
+		},
+		// No Do: this cue only assembles what the others fetched, so it costs
+		// the workflow nothing.
+		Run: func(_ struct{}, s countState) (deck.Mutation[countState], error) {
+			report := fmt.Sprintf("%d values", len(s.Values))
+			return deck.Complete(func(s *countState) { s.Report = report }), nil
+		},
+	})
+	return runCountDeck(ctx, cues...)
+}
+
 func TestOneActivityPerDoAndNoneForComplete(t *testing.T) {
 	c := startDevServer(t)
-
-	w := worker.New(c, countQueue, worker.Options{})
-	w.RegisterWorkflow(CountingWorkflow)
-	w.RegisterActivity(Echo)
-	require.NoError(t, w.Start())
-	t.Cleanup(w.Stop)
+	startWorker(t, c, countQueue, func(w worker.Worker) {
+		w.RegisterWorkflow(CountingWorkflow)
+		w.RegisterActivity(Echo)
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
@@ -101,12 +107,7 @@ func TestOneActivityPerDoAndNoneForComplete(t *testing.T) {
 	require.Equal(t, "3 values", out.Report)
 
 	// When the recorded history is counted
-	scheduled := 0
-	for _, e := range historyOf(t, c, run.GetID(), run.GetRunID()).Events {
-		if e.GetEventType() == enumspb.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED {
-			scheduled++
-		}
-	}
+	scheduled := scheduledActivities(historyOf(t, c, run.GetID(), run.GetRunID()))
 
 	// Then there is exactly one activity per Do, and none for the cue that only
 	// read state — four cues, three activities
@@ -118,26 +119,12 @@ func TestOneActivityPerDoAndNoneForComplete(t *testing.T) {
 // panics should fail the workflow as a named cue error, the same shape a caller
 // sees under every other Engine.
 func PanickingCueWorkflow(ctx workflow.Context) (countState, error) {
-	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout: 30 * time.Second,
-	})
-	cue := deck.Cue[struct{}, countState]{
+	return runCountDeck(ctx, deck.Cue[struct{}, countState]{
 		Name: "Boom",
 		Run: func(_ struct{}, _ countState) (deck.Mutation[countState], error) {
 			panic("cue exploded")
 		},
-	}
-	d, err := deck.New(cue)
-	if err != nil {
-		return countState{}, fmt.Errorf("build deck: %w", err)
-	}
-	d.Engine = decktemporal.New(ctx)
-
-	var s countState
-	if _, err := d.Run(context.Background(), struct{}{}, &s); err != nil {
-		return s, fmt.Errorf("run deck: %w", err)
-	}
-	return s, nil
+	})
 }
 
 func TestAPanickingCueFailsTheWorkflowAsACueError(t *testing.T) {
@@ -172,12 +159,10 @@ func firstLine(s string) string {
 // Temporal's, not the runner's.
 func TestAWideFanOutCompletesInOneWorkflow(t *testing.T) {
 	c := startDevServer(t)
-
-	w := worker.New(c, wideQueue, worker.Options{})
-	w.RegisterWorkflow(WideFanOutWorkflow)
-	w.RegisterActivity(Echo)
-	require.NoError(t, w.Start())
-	t.Cleanup(w.Stop)
+	startWorker(t, c, wideQueue, func(w worker.Worker) {
+		w.RegisterWorkflow(WideFanOutWorkflow)
+		w.RegisterActivity(Echo)
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
@@ -200,12 +185,7 @@ func TestAWideFanOutCompletesInOneWorkflow(t *testing.T) {
 	// And the history stayed proportionate: a handful of events per activity,
 	// nothing quadratic
 	hist := historyOf(t, c, run.GetID(), run.GetRunID())
-	scheduled := 0
-	for _, e := range hist.Events {
-		if e.GetEventType() == enumspb.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED {
-			scheduled++
-		}
-	}
+	scheduled := scheduledActivities(hist)
 	t.Logf("%d cues -> %d activities, %d history events, %v",
 		wideCount, scheduled, len(hist.Events), elapsed.Round(10*time.Millisecond))
 	assert.Equal(t, wideCount, scheduled)
@@ -219,32 +199,9 @@ const (
 )
 
 func WideFanOutWorkflow(ctx workflow.Context) (countState, error) {
-	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-		StartToCloseTimeout: 30 * time.Second,
-	})
-
-	var cues []deck.Cue[struct{}, countState]
-	for i := range wideCount {
-		name := fmt.Sprintf("cue%d", i)
-		cues = append(cues, deck.Cue[struct{}, countState]{
-			Name: name,
-			Run: func(_ struct{}, _ countState) (deck.Mutation[countState], error) {
-				return deck.Do(Echo, name, func(v string) deck.Mutation[countState] {
-					return deck.Complete(func(s *countState) { s.Values = append(s.Values, v) })
-				}), nil
-			},
-		})
+	names := make([]string, wideCount)
+	for i := range names {
+		names[i] = fmt.Sprintf("cue%d", i)
 	}
-
-	d, err := deck.New(cues...)
-	if err != nil {
-		return countState{}, fmt.Errorf("build deck: %w", err)
-	}
-	d.Engine = decktemporal.New(ctx)
-
-	var s countState
-	if _, err := d.Run(context.Background(), struct{}{}, &s); err != nil {
-		return s, fmt.Errorf("run deck: %w", err)
-	}
-	return s, nil
+	return runCountDeck(ctx, echoCues(names...)...)
 }

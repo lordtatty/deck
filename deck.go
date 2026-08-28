@@ -566,11 +566,12 @@ func (r *runner[I, S]) absorb(a *attempt[S]) {
 		return
 	}
 	if w, ok := a.mutation.(*workMutation[S]); ok {
-		// Starting the work is what causes the side effect, so a run that has
-		// already decided to stop does not start it: draining lets work in
-		// flight finish, not begin. The cue stays uncompleted, so a resumed
-		// run triggers it again.
-		if r.runErr != nil || r.suspended {
+		// Starting the work is what causes the side effect, so a failing run
+		// does not start it: its results are about to be discarded anyway.
+		// A suspending run is different — its state is about to be exported,
+		// so the work runs and the cue is recorded, or the snapshot would be
+		// missing a result nothing could recover.
+		if r.runErr != nil {
 			return
 		}
 		work := w.work

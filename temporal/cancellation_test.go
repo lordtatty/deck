@@ -84,12 +84,10 @@ func CancellableWorkflow(ctx workflow.Context) (cancelState, error) {
 
 func TestCancellingTheWorkflowStopsTheDeckPromptly(t *testing.T) {
 	c := startDevServer(t)
-
-	w := worker.New(c, cancelQueue, worker.Options{})
-	w.RegisterWorkflow(CancellableWorkflow)
-	w.RegisterActivity(SlowLeg)
-	require.NoError(t, w.Start())
-	t.Cleanup(w.Stop)
+	startWorker(t, c, cancelQueue, func(w worker.Worker) {
+		w.RegisterWorkflow(CancellableWorkflow)
+		w.RegisterActivity(SlowLeg)
+	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()

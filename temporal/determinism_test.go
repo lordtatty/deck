@@ -103,13 +103,22 @@ func startDevServer(t *testing.T) client.Client {
 	return srv.Client()
 }
 
-func startWorker(t *testing.T, c client.Client) {
+// startWorker runs a worker on queue for the rest of the test, with whatever
+// register puts on it.
+func startWorker(t *testing.T, c client.Client, queue string, register func(worker.Worker)) {
 	t.Helper()
-	w := worker.New(c, detQueue, worker.Options{})
-	w.RegisterWorkflow(DeterminismWorkflow)
-	w.RegisterActivity(JitteredStep)
+	w := worker.New(c, queue, worker.Options{})
+	register(w)
 	require.NoError(t, w.Start(), "starting worker")
 	t.Cleanup(w.Stop)
+}
+
+func startDetWorker(t *testing.T, c client.Client) {
+	t.Helper()
+	startWorker(t, c, detQueue, func(w worker.Worker) {
+		w.RegisterWorkflow(DeterminismWorkflow)
+		w.RegisterActivity(JitteredStep)
+	})
 }
 
 func historyOf(t *testing.T, c client.Client, workflowID, runID string) *historypb.History {
@@ -129,12 +138,24 @@ func historyOf(t *testing.T, c client.Client, workflowID, runID string) *history
 	return &hist
 }
 
+// scheduledActivities counts the activities a history records being started —
+// one per deck.Do that reached the engine.
+func scheduledActivities(hist *historypb.History) int {
+	n := 0
+	for _, e := range hist.Events {
+		if e.GetEventType() == enumspb.EVENT_TYPE_ACTIVITY_TASK_SCHEDULED {
+			n++
+		}
+	}
+	return n
+}
+
 // TestParallelWorkReplaysDeterministically is the headline claim: work that
 // really did run in parallel, and finished in an order nobody chose, replays
 // down exactly the same path.
 func TestParallelWorkReplaysDeterministically(t *testing.T) {
 	c := startDevServer(t)
-	startWorker(t, c)
+	startDetWorker(t, c)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -178,7 +199,7 @@ func TestParallelWorkReplaysDeterministically(t *testing.T) {
 // above would pass just as happily if the replayer checked nothing.
 func TestReplayCatchesDivergence(t *testing.T) {
 	c := startDevServer(t)
-	startWorker(t, c)
+	startDetWorker(t, c)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

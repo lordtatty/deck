@@ -86,7 +86,9 @@ type Future interface {
 // Goroutines returns the default Engine: a goroutine per cue, the wall clock,
 // and an Await that blocks until a cue finishes or ctx is cancelled.
 //
-// An Engine may be shared between concurrent runs.
+// An Engine may be shared between concurrent runs. Every cue finishing wakes
+// every run waiting on the engine, so with hundreds of runs sharing one, an
+// engine per run is cheaper — which is what a Deck with a nil Engine gets.
 func Goroutines() Engine {
 	return &goEngine{wake: make(chan struct{})}
 }

@@ -3099,18 +3099,22 @@ func TestDeck_Run_HandlesALargeFanOut(t *testing.T) {
 
 // Goroutines() documents that an Engine may be shared between concurrent runs,
 // so it has to actually be true. The engine wakes waiting runs when a cue
-// finishes; if it signalled only one of them, a run whose own cue is still
-// going would consume the nudge meant for another, and that other run would
-// wait for a wakeup that had already been taken.
+// finishes; if it signalled only one of them, a run whose own cue was still
+// going could take the nudge meant for another, and that other run would wait
+// for a wakeup already consumed.
 //
-// Two runs with very different cue durations make that visible: the bug shows
-// up as the fast run finishing in the slow run's time, and the slow run never
-// finishing at all.
+// The shape matters for catching that reliably. A single-slot signal hands each
+// nudge to whichever run has been waiting longest, so the slow run starts first
+// and parks before any fast run exists: under a one-slot signal it then takes
+// the first fast completion's nudge, and the last fast run to finish is left
+// waiting for the slow run instead of returning at once. Three fast runs rather
+// than one leave no room for scheduling luck to hide it.
 //
-// Note the engine is created once, outside the loop. Every other test builds
-// one per run, which is why none of them caught this.
+// Every other test builds an engine per run, which is why none of them caught
+// this.
 func TestDeck_Run_OneEngineSharedBetweenConcurrentRuns(t *testing.T) {
 	shared := deck.Goroutines()
+	const fast, slow = 100 * time.Millisecond, 500 * time.Millisecond
 
 	newRun := func(d time.Duration) *deck.Deck[struct{}, TestState] {
 		cue := deck.Cue[struct{}, TestState]{
@@ -3126,13 +3130,22 @@ func TestDeck_Run_OneEngineSharedBetweenConcurrentRuns(t *testing.T) {
 		return sut
 	}
 
-	// When a fast run and a slow run go at once on that one engine
-	const fast, slow = 100 * time.Millisecond, 500 * time.Millisecond
-	var wg sync.WaitGroup
-	took := make([]time.Duration, 2)
-	errs := make([]error, 2)
+	// Decks are built here, on the test goroutine, so a failure in New reports
+	// cleanly rather than from inside a worker.
+	durations := []time.Duration{slow, fast, fast, fast}
+	decks := make([]*deck.Deck[struct{}, TestState], len(durations))
+	for i, d := range durations {
+		decks[i] = newRun(d)
+	}
 
-	for i, d := range []time.Duration{fast, slow} {
+	// When the slow run is parked first and three fast runs join it
+	took := make([]time.Duration, len(decks))
+	errs := make([]error, len(decks))
+	var wg sync.WaitGroup
+	for i := range decks {
+		if i == 1 {
+			time.Sleep(50 * time.Millisecond) // let the slow run reach Await
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -3140,17 +3153,20 @@ func TestDeck_Run_OneEngineSharedBetweenConcurrentRuns(t *testing.T) {
 			defer cancel()
 
 			start := time.Now()
-			_, err := newRun(d).Run(ctx, struct{}{}, &TestState{})
+			_, err := decks[i].Run(ctx, struct{}{}, &TestState{})
 			took[i], errs[i] = time.Since(start), err
 		}()
 	}
 	wg.Wait()
 
-	// Then both finish on their own schedule, neither waiting on the other
-	require.NoError(t, errs[0])
-	require.NoError(t, errs[1])
-	t.Logf("fast run %v, slow run %v", took[0].Round(10*time.Millisecond), took[1].Round(10*time.Millisecond))
-	assert.Less(t, took[0], slow, "the fast run should not have waited for the slow one's cue")
+	// Then every run finishes on its own schedule, none waiting on another
+	for i, d := range durations {
+		require.NoErrorf(t, errs[i], "run %d (%v cue)", i, d)
+		t.Logf("run %d (%v cue) took %v", i, d, took[i].Round(10*time.Millisecond))
+		if d == fast {
+			assert.Lessf(t, took[i], slow, "run %d: a fast run waited for the slow one", i)
+		}
+	}
 }
 
 // Draining lets cues in flight finish. A cue whose Run declared work with Do
@@ -3202,4 +3218,68 @@ func TestDeck_Run_DoesNotStartDeclaredWorkAfterAnError(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.False(t, workRan, "declared work must not start once the run is failing")
+}
+
+// Suspending is a pause, not a failure: the run's state is about to be exported
+// and resumed, so a sibling that declared work must still finish and be
+// recorded, or its result is missing from the snapshot. That matters most when
+// the suspending cue's own mutation changes what the sibling's When sees — as
+// here, where a resumed run would no longer trigger it, and the work would be
+// lost with nothing in Result to say so.
+//
+// Runs under every engine because the outcome must not depend on which cue the
+// engine happens to absorb first. Under Serial the suspension always lands
+// before the sibling is reached; under Goroutines either order can happen.
+func TestDeck_Run_SuspendStillCompletesASiblingsDeclaredWork(t *testing.T) {
+	for _, mode := range executionModes() {
+		t.Run(mode.name, func(t *testing.T) {
+			// Given a cue that suspends and flips state, and a sibling that
+			// declared work and only triggers on the state before the flip
+			var mu sync.Mutex
+			workRan := false
+			work := func(_ context.Context, _ string) (rune, error) {
+				mu.Lock()
+				workRan = true
+				mu.Unlock()
+				return 'w', nil
+			}
+
+			suspender := deck.Cue[struct{}, TestState]{
+				Name: "suspender",
+				When: func(_ struct{}, s TestState, _ deck.Result) bool { return s.Count == 0 },
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Suspended(func(s *TestState) { s.Count = 1 }), nil
+				},
+			}
+			worker := deck.Cue[struct{}, TestState]{
+				Name: "worker",
+				When: func(_ struct{}, s TestState, _ deck.Result) bool { return s.Count == 0 },
+				Run: func(_ struct{}, _ TestState) (deck.Mutation[TestState], error) {
+					return deck.Do(work, "x", func(r rune) deck.Mutation[TestState] {
+						return deck.Complete(func(s *TestState) { s.Buffer = append(s.Buffer, r) })
+					}), nil
+				},
+			}
+
+			sut, err := deck.New(suspender, worker)
+			require.NoError(t, err)
+			mode.apply(sut)
+
+			// When the deck runs and suspends
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			state := &TestState{}
+			result, err := runBounded(t, sut, ctx, struct{}{}, state)
+
+			// Then the sibling's work ran and it is recorded, so the snapshot
+			// is whole
+			require.NoError(t, err)
+			assert.True(t, result.Suspended)
+			mu.Lock()
+			assert.True(t, workRan, "declared work must still run when the run is only suspending")
+			mu.Unlock()
+			assert.True(t, result.Completed("worker"))
+			assert.Equal(t, []rune{'w'}, state.Buffer)
+		})
+	}
 }

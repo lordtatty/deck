@@ -4,12 +4,18 @@
 // channels or selects. This package supplies a deck.Engine that satisfies all
 // of that, so the cues themselves need no knowledge of Temporal:
 //
-//	ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-//		StartToCloseTimeout: time.Minute,
-//	})
+//	var flowDeck, _ = deck.New(cues...)   // once, at startup
 //
-//	d := flowDeck.WithEngine(temporal.New(ctx))
-//	_, err := d.Run(context.Background(), input, &state)
+//	func MyWorkflow(ctx workflow.Context, input Input) (State, error) {
+//		ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+//			StartToCloseTimeout: time.Minute,
+//		})
+//		d := flowDeck.WithEngine(temporal.New(ctx))
+//
+//		var state State
+//		_, err := d.Run(context.Background(), input, &state)
+//		return state, err
+//	}
 //
 // Work a cue declares with deck.Do becomes an activity: register the same
 // functions with your worker and Temporal resolves them by name. Use ForCue
