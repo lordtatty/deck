@@ -42,7 +42,8 @@
 //
 // # Declaring work
 //
-// A Cue's Run may do its work directly and return Complete. It may instead
+// A Cue's Run may do its work directly and return Complete. Where the work
+// leaves the process, is slow, or is not deterministic, it should instead
 // describe the work with Do and let the Engine perform it:
 //
 //	Run: func(in Input, s State) (deck.Mutation[State], error) {
@@ -55,6 +56,9 @@
 // the work runs. A cue written this way does not know where its work happens,
 // which is what lets the same cues run on goroutines in one process and as
 // durable activities in another.
+//
+// Most flows mix the two: cues that fetch or call something use Do, and a cue
+// that merely assembles what they gathered uses Complete.
 //
 // # Suspend and resume
 //
@@ -182,6 +186,12 @@ func Suspended[S any](fn func(*S)) Mutation[S] {
 // Do declares work for the Deck's Engine to perform, rather than performing it
 // in the cue. fn is an ordinary Go function; then turns its result into a state
 // update once the work has finished.
+//
+// Use Do where the work leaves the process, is slow, or is not deterministic.
+// A cue that only computes from state it already holds should return Complete
+// instead: it will run inline, and under a durable engine it costs nothing,
+// where a Do would cost a scheduled unit of work and an entry in the run's
+// history.
 //
 // Under the default Engine, fn is simply called on its own goroutine. Under a
 // durable engine it may run elsewhere — as a Temporal activity, say — so fn and

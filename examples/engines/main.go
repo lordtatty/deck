@@ -25,6 +25,7 @@ type ReportInput struct {
 
 type ReportState struct {
 	Sections []string
+	Summary  string
 }
 
 // fetchSection is an ordinary Go function. Nothing about it knows what a Deck
@@ -44,10 +45,23 @@ func fetchSection(ctx context.Context, name string) (string, error) {
 	return name, nil
 }
 
-// cues builds three independent cues. Each declares its work with deck.Do
-// rather than performing it, so the Engine decides how it runs.
+// cues builds four cues, and they are deliberately not all the same shape.
+//
+// Not every cue should declare work. The choice is about what the cue actually
+// does:
+//
+//   - deck.Do  — the work leaves this process, or is slow, or is not
+//     deterministic: a network call, a database query, an LLM request. The
+//     Engine decides where it runs, and under a durable engine it becomes a
+//     retryable, recorded unit of work.
+//
+//   - deck.Complete — the cue only computes from state it already has. Handing
+//     that to an Engine buys nothing; under Temporal it would cost a round trip
+//     to the server and an entry in the workflow history for a string join.
 func cues() []deck.Cue[ReportInput, ReportState] {
 	var out []deck.Cue[ReportInput, ReportState]
+
+	// Three fetches. Each one goes somewhere slow, so each declares its work.
 	for _, n := range []string{"summary", "charts", "tables"} {
 		name := n
 		out = append(out, deck.Cue[ReportInput, ReportState]{
@@ -64,6 +78,20 @@ func cues() []deck.Cue[ReportInput, ReportState] {
 			},
 		})
 	}
+
+	// The assembly step. It waits for all three, then does nothing but read
+	// what they gathered — so it stays inline, whatever the Engine is.
+	out = append(out, deck.Cue[ReportInput, ReportState]{
+		Name: "assemble",
+		When: func(_ ReportInput, _ ReportState, r deck.Result) bool {
+			return r.Completed("summary") && r.Completed("charts") && r.Completed("tables")
+		},
+		Run: func(in ReportInput, s ReportState) (deck.Mutation[ReportState], error) {
+			summary := fmt.Sprintf("%s: %d sections", in.Title, len(s.Sections))
+			return deck.Complete(func(s *ReportState) { s.Summary = summary }), nil
+		},
+	})
+
 	return out
 }
 
@@ -81,18 +109,23 @@ func run(label string, engine deck.Engine) {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("%-22s %-28s %v   (%d cues)\n",
+	order := make([]string, 0, len(result.CompletedCues))
+	for _, c := range result.CompletedCues {
+		order = append(order, c.Name)
+	}
+	fmt.Printf("%-22s %-42s %v\n",
 		label,
-		strings.Join(state.Sections, " -> "),
+		strings.Join(order, " -> "),
 		time.Since(start).Round(10*time.Millisecond),
-		len(result.CompletedCues),
 	)
 }
 
 func main() {
-	fmt.Println("Three cues, each declaring 100-300ms of work.")
+	fmt.Println("Three cues fetch something slow and declare their work with deck.Do.")
+	fmt.Println("A fourth only reads what they gathered, so it uses deck.Complete and")
+	fmt.Println("runs inline — no Engine involved, and no cost under a durable engine.")
 	fmt.Println()
-	fmt.Printf("%-22s %-28s %s\n", "ENGINE", "ORDER COMPLETED", "TOOK")
+	fmt.Printf("%-22s %-42s %s\n", "ENGINE", "ORDER COMPLETED", "TOOK")
 
 	// The default. Work runs concurrently, so the whole run takes about as long
 	// as the slowest cue, and results arrive shortest-first.
@@ -106,4 +139,6 @@ func main() {
 
 	fmt.Println()
 	fmt.Println("Same cues both times. Only the Engine changed.")
+	fmt.Println("Note assemble is always last: it waits for the other three, and")
+	fmt.Println("costs nothing to run because it does no work of its own.")
 }

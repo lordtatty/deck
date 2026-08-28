@@ -42,6 +42,12 @@ type Fulfilment struct {
 // cues describes the flow. Stock and payment are independent, so they go out
 // together; shipping waits for both; the confirmation waits for shipping.
 //
+// Three cues declare work with deck.Do and one does not, which is the usual
+// shape. Do is for work that leaves the process: it becomes a Temporal
+// activity, so it is retried, timed out and recorded independently. That is
+// worth having for a warehouse call or a payment, and not worth having for
+// assembling a sentence — which is why "confirm" below uses Complete instead.
+//
 // Nothing here mentions retries or timeouts. Those are Temporal's business, and
 // they are configured in the workflow below.
 func cues() []deck.Cue[Order, Fulfilment] {
@@ -74,7 +80,10 @@ func cues() []deck.Cue[Order, Fulfilment] {
 			},
 		},
 		{
-			// No work of its own — it only reads state, so a plain Complete.
+			// Complete, not Do: this only reads state the other cues filled
+			// in. As an activity it would cost a round trip and a history
+			// entry to run a Sprintf, and gain nothing — there is nothing here
+			// that can fail, time out, or need retrying.
 			Name: "confirm",
 			When: func(_ Order, _ Fulfilment, r deck.Result) bool {
 				return r.Completed("ship")

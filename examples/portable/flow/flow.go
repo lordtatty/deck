@@ -52,6 +52,10 @@ func pause(ctx context.Context, d time.Duration) error {
 
 // Cues returns the flow. Profile and orders have nothing to do with each other,
 // so they go out together; the report waits for both.
+//
+// Note that only two of the three cues declare work. Do is for work that leaves
+// the process — a lookup, a call, anything slow. The report cue only reads state
+// the others filled in, so it uses Complete and runs inline.
 func Cues() []deck.Cue[Input, State] {
 	return []deck.Cue[Input, State]{
 		{
@@ -80,8 +84,9 @@ func Cues() []deck.Cue[Input, State] {
 			When: func(_ Input, _ State, r deck.Result) bool {
 				return r.Completed("profile") && r.Completed("orders")
 			},
-			// This cue needs no work of its own — it just reads state, so it
-			// returns a plain Complete rather than a Do.
+			// No Do here: this is a string built from state we already have.
+			// Wrapping it in Do would make it a Temporal activity, costing a
+			// round trip and a history entry to do a Sprintf.
 			Run: func(_ Input, s State) (deck.Mutation[State], error) {
 				report := fmt.Sprintf("%s has %d orders", s.Profile, len(s.Orders))
 				return deck.Complete(func(s *State) { s.Report = report }), nil

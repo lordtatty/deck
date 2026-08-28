@@ -235,7 +235,20 @@ Run: func(in Input, s State) (deck.Mutation[State], error) {
 
 `deck.Do` returns immediately — it hands the work to the Engine and lets the Deck carry on triggering other cues. That is where the parallelism comes from, and it is why the same cue works whether the Engine runs the function on a goroutine or dispatches it to a worker on another machine.
 
-Use `deck.Complete` as before for a cue that only reads state and needs no work of its own.
+#### `Do` or `Complete`?
+
+Not every cue should declare work. Most flows are a mixture:
+
+| Use | When | Cost under Temporal |
+|---|---|---|
+| `deck.Do` | The work leaves the process, is slow, or is not deterministic — a network call, a database query, an LLM request | One activity: retried, timed out and recorded independently |
+| `deck.Complete` | The cue only computes from state it already holds | None. It runs inline as workflow code |
+
+A join cue that formats a string from what the others fetched should be a `Complete`. Making it a `Do` would cost a round trip to the Temporal server and an entry in the workflow history to run a `Sprintf`, and would gain nothing — there is nothing there that can fail, time out, or need retrying.
+
+The distinction is load-bearing under Temporal, and harmless without it: with the default Engine, `Do` simply runs the function on a goroutine.
+
+One thing to be careful of: a cue that does slow or non-deterministic work **inline in `Run`** is fine in plain Go, but under Temporal it runs on the workflow coroutine, where it will break replay or trip the deadlock detector. That is what `Do` exists to avoid.
 
 ### Running Durably with Temporal
 

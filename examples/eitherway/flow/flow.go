@@ -59,6 +59,13 @@ func pause(ctx context.Context, d time.Duration) error {
 // Cues is the flow: fetch, then summarise and pull keywords at the same time,
 // then index once both are done.
 //
+// Three of the four cues declare their work with deck.Do, because they go
+// somewhere slow. The last one does not: it only reads what the others
+// gathered, so it returns Complete and runs inline. Declaring work costs
+// something — under Temporal each Do is an activity, with a round trip and an
+// entry in the workflow's history — so it is worth spending only where the work
+// really leaves the process.
+//
 //	fetch ──┬── summarise ──┐
 //	        └── keywords  ──┴── index
 func Cues() []deck.Cue[Input, State] {
@@ -90,6 +97,8 @@ func Cues() []deck.Cue[Input, State] {
 			},
 		},
 		{
+			// No Do: formatting a string from state we already hold is not work
+			// worth sending anywhere. This runs inline under every Engine.
 			Name: "index",
 			When: func(_ Input, _ State, r deck.Result) bool {
 				return r.Completed("summarise") && r.Completed("keywords")
