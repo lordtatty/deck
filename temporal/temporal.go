@@ -18,6 +18,12 @@
 // Work a cue declares with deck.Do becomes an activity. Register the same
 // functions with your worker, and Temporal resolves them by name.
 //
+// deck's own Suspend/Export/Import still work here, but they are usually the
+// wrong tool once Temporal is doing the durability: suspending ends the
+// workflow, and resuming means starting a new one. For long-running or
+// callback-driven work, keep the cue a normal deck.Do and use a generous
+// activity timeout, Temporal's async activity completion, or a signal.
+//
 // Two things to know:
 //
 //   - Cancellation reaches the Deck through the workflow context this engine

@@ -294,6 +294,8 @@ d.Engine = decktemporal.New(ctx,
 )
 ```
 
+If your flow uses `Suspend`/`Export`/`Import`, see [Suspend, or a durable engine?](#suspend-or-a-durable-engine) — under Temporal you usually want neither of them.
+
 Three things worth knowing:
 
 - **Cancellation** reaches the Deck through the Engine's workflow context, not through the context passed to `Run`. Pass `context.Background()` there.
@@ -478,6 +480,26 @@ The typical flow with two concurrent suspends:
 4. Copy webhook → worker acquires lock → loads input + snapshot → resumes Deck → copy collected → all done → deletes both keys → releases lock.
 
 If both webhooks arrive simultaneously, one worker gets the lock and processes. The second worker waits or retries with the updated snapshot — no duplicated work.
+
+### Suspend, or a durable engine?
+
+`Suspend`/`Export`/`Import` and a durable Engine solve the same problem — work that outlives the process — by opposite means. Both are fully supported; which you want depends on whether you have a workflow engine.
+
+**Without one, `Suspend` is the answer**, and nothing about it has changed. A cue kicks off async work and suspends, you persist the snapshot wherever you like, and any worker can pick it up when the callback arrives. `examples/jobqueue` is that pattern end to end with Redis. Deck carries the state; you carry the durability.
+
+**With Temporal, you usually want neither.** The engine is already keeping your flow alive across process death — that is what [the durability tests](temporal) demonstrate — so suspending to persist state yourself gives up what you came for: the workflow ends, its history stops there, and resuming means starting a new one and rebuilding state by hand.
+
+For the case `Suspend` exists for — *kick something off and come back when it answers* — Temporal has better-fitting tools:
+
+| You want | Reach for |
+|---|---|
+| Work that takes minutes or hours | `deck.Do` with a generous `StartToCloseTimeout`, and heartbeats if it is long |
+| An external system that calls **you** back | An activity using Temporal's async completion (the task-token pattern): the activity returns `ErrResultPending` and something else completes it later |
+| To wait for an event or a decision | A signal, awaited inside the activity or the workflow |
+
+In each case the cue stays a normal `Do` and the flow never stops.
+
+**Suspend does still work under a Temporal Engine** if you want it — a suspending cue applies its mutation, the run drains and returns `Suspended`, and `Export`/`Import` round-trip as usual, all of it deterministic and replay-safe. There is a test pinning exactly that, so the option is real rather than accidental. It is just rarely the tool you want once something else is already guaranteeing your flow survives.
 
 ## Runnable Examples
 
